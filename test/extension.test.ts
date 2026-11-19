@@ -41,7 +41,7 @@ describe('python pi extension', () => {
     const { tool } = await loadExtension({ tools: [greet], noBuiltins: true })
     expect(tool.name).toBe('code')
     expect(tool.description).toContain('def greet(name: str) -> str:')
-    expect(tool.description).toContain('NOT standalone pi tools')
+    expect(tool.description).toContain('Call listed helpers as Python functions')
     expect(tool.description).toContain('print(ls("."))')
     expect(tool.description).toContain('WITHOUT `await`')
   })
@@ -266,7 +266,7 @@ describe('python pi extension', () => {
     expect(await grab({ root: '/tmp', bridgePiTools: false })).not.toContain('DERIVED content')
   })
 
-  it('derives guideline examples from the actual registry', async () => {
+  it('keeps helper availability in the current tool description', async () => {
     const tools: { promptGuidelines?: string[] }[] = []
     const api = {
       registerTool: (t: unknown) => tools.push(t as (typeof tools)[number]),
@@ -276,7 +276,7 @@ describe('python pi extension', () => {
       api as never,
     )
     const guidelines = tools[0].promptGuidelines!.join('\n')
-    expect(guidelines).toContain('greet')
+    expect(guidelines).toContain('current code tool description')
     expect(guidelines).not.toContain('list_files')
   })
 

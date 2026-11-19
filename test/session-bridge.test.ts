@@ -64,6 +64,13 @@ describe('session-backed Python bridge', () => {
     expect(first).toContain('background: bool = ...')
     expect(first).not.toContain('def edit(')
     expect(first).not.toContain('def write(')
+    expect(first).toContain('print(read("file.txt"))')
+    expect(first).not.toContain('print(ls(')
+    expect(first).not.toContain('NOT standalone')
+    expect(first).toContain('mirror callable registered Pi tools')
+    const empty = code.prepareLoadout!({ callable: [] }).descriptions.code
+    expect(empty).toContain('print(1 + 1)')
+    expect(empty).not.toContain('def read(')
     const second = code.prepareLoadout!({ callable: [readTool('resource')] }).descriptions.code
     expect(second).toContain('def read(resource: str)')
     expect(second).not.toContain('def bash(')
@@ -175,6 +182,16 @@ describe('session-backed Python bridge', () => {
       undefined, undefined, context)
     expect(result.details.status).toBe('error')
     expect(result.content[0].text).toContain("Tool 'read' is not callable in this session")
+    expect(calls).toBe(0)
+    context.tools = [readTool()]
+    const description = code.prepareLoadout!({ callable: context.tools }).descriptions.code
+    expect(description).not.toContain('def find(')
+    expect(description).not.toContain('def grep(')
+    expect(description).not.toContain('def ls(')
+    const disabledFind = await code.execute('disabled-find', { reset: true, code: 'find("*.ts")' },
+      undefined, undefined, context)
+    expect(disabledFind.details.status).toBe('error')
+    expect(disabledFind.content[0].text).toContain("Tool 'find' is not callable in this session")
     expect(calls).toBe(0)
   })
 

@@ -237,7 +237,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
       restoredUnverified = Boolean(state)
     })
 
-    function describe(visibleRegistry: ToolRegistry = registry): string {
+    function describe(visibleRegistry: ToolRegistry = registry, sessionBacked = false): string {
       const gatedNames = visibleRegistry.list().filter((tool) => tool.requiresApproval).map((tool) => tool.name)
       return [
         'Run Python in a sandboxed interpreter with host tools available as plain',
@@ -245,9 +245,12 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         'Prefer this tool when you need to chain tool calls, loop, filter large',
         'results, or compute — do the work in code and print only what you need.',
         '',
-        'Python-only helper functions available INSIDE this tool:',
-        `- These names are NOT standalone pi tools; they only exist in Python code passed to ${toolName}.`,
-        `- Example: call ${toolName} with code like \`print(ls("."))\`; do not try to invoke \`ls\` as a separate pi tool.`,
+        'Python helper functions available inside this tool:',
+        `- Call listed helpers as Python functions in the code passed to ${toolName}.`,
+        ...(sessionBacked ? [
+          '- Pi-backed helpers mirror callable registered Pi tools and follow the session tool settings.',
+        ] : []),
+        `- Example: call ${toolName} with code like \`${helperExample(visibleRegistry)}\`.`,
         '',
         visibleRegistry.renderStubs(),
         ...(savedSummary
@@ -275,6 +278,8 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     }
 
     // New Pi versions provide the callable loadout before each model request.
+    // Defaults expose read/bash/edit/write. ls/find/grep appear only when callable;
+    // this extension does not enable them or bypass an explicit tool restriction.
     // Older versions ignore this optional hook and keep the standalone stubs.
     const loadoutHooks = bridge ? {
       prepareLoadout(loadout: { callable: readonly PiBridgeTool[] }) {
@@ -283,7 +288,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           (tool) => !bridgeNames.has(tool.name) || callable.has(tool.name),
         ))
         return bridgeExecution.run({ tools: loadout.callable }, () => ({
-          descriptions: { [toolName]: describe(visible) },
+          descriptions: { [toolName]: describe(visible, true) },
         }))
       },
     } : {}
@@ -303,7 +308,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           : []),
         ...(registry.list().length > 0
           ? [
-              `Names listed in the ${toolName} tool description are Python helper functions only, not top-level pi tools. If you need one (for example ${formatNameList(registry.list().slice(0, 6).map((t) => t.name))}), call ${toolName} and invoke it from Python code there.`,
+              `Use only helper functions listed in the current ${toolName} tool description.`,
             ]
           : []),
         ...(store
@@ -454,10 +459,17 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
   }
 }
 
-function formatNameList(names: string[]): string {
-  if (names.length === 0) return 'the listed functions'
-  if (names.length === 1) return names[0]!
-  return `${names.slice(0, -1).join(', ')}, or ${names[names.length - 1]}`
+function helperExample(registry: ToolRegistry): string {
+  const examples = [
+    ['ls', '"."'], ['read', '"file.txt"'], ['find', '"*.ts"'], ['grep', '"TODO"'],
+  ]
+  for (const [name, argument] of examples) {
+    const helper = registry.get(name)
+    if (helper?.params[0]?.type === 'str' && helper.params.slice(1).every((param) => param.optional)) {
+      return `print(${name}(${argument}))`
+    }
+  }
+  return 'print(1 + 1)'
 }
 
 function formatValue(value: unknown): string {
