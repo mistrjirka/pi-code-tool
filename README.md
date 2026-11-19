@@ -160,9 +160,25 @@ This fork pins `@pydantic/monty@1.0.0` and requires Node 20 or newer.
   by default. Native source/type metadata can grow across feeds. The source
   of a pending snippet has the same bound. Exceeding a
   limit returns an error and preserves the last committed heap.
-- Legacy version-1/version-2 state cannot recover its original direct file reads.
-  It stays unchanged and blocks execution until the caller explicitly supplies
-  `reset=true`. It is never silently replayed or reset.
+- Legacy version-1/version-2 state imports on first use, including plain JSON
+  and compressed Pi snapshots. Recovery reconstructs saved variables and functions
+  from recorded inputs, code, and cached helper results. Historical helpers never
+  execute again, and historical output and approvals stay suppressed. New code
+  starts only after the saved helper cache is fully consumed.
+- Legacy state did not record direct filesystem observations. Import reads the
+  current read-only mounts during recovery, matching the old continuation behavior. It cannot
+  recover missing original file bytes. After import, native checkpoints retain
+  those values and stop further historical reads. Even a writable SDK mount is
+  restricted to read-only access during import. Non-filesystem OS calls use native
+  default errors during recovery, so historical code cannot introduce a sleep.
+- If historical assertions, helper types, or cached call order no longer match,
+  import reports the specific cause and preserves the exact original snapshot.
+  Fix the cause and retry, or explicitly reset. Cached calls never fall through
+  to live execution on failure. Version-1 calls may lack argument keys, and the
+  old version-2 serializer did not retain dictionary contents in its call keys.
+- Import uses recorded inputs only. New-call inputs affect only new code.
+  A legacy paused frame uses its saved pending inputs, while its separate rollback
+  heap retains completed inputs for explicit abandonment.
 - Changing the interpreter version, helper parameter/return types, type-check
   setting, script name, or configured execution limits requires an explicit
   reset. Tool descriptions and registration order do not force a reset.

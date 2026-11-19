@@ -176,6 +176,14 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     let preludeNote = ''
     // Keep incompatible state byte-for-byte until an explicit reset.
     let blockedState: { state: string; error: string } | null = null
+    let restoredState: { encoded: string; decoded: string } | null = null
+
+    function savedState(current: Session): string {
+      const serialized = current.dump()
+      // Preserve the original plain/gzip representation while lazy import fails,
+      // or when a control request leaves the restored state unchanged.
+      return restoredState?.decoded === serialized ? restoredState.encoded : encodeSessionState(serialized)
+    }
 
     async function freshSession(
       opts: { quiet?: boolean; mount?: MountDir } = {},
@@ -227,8 +235,11 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         }
       }
       blockedState = null
+      restoredState = null
       try {
-        session = state ? Session.load(decodeSessionState(state), sessionOptions) : null
+        const decoded = state ? decodeSessionState(state) : undefined
+        session = decoded === undefined ? null : Session.load(decoded, sessionOptions)
+        if (state && decoded !== undefined) restoredState = { encoded: state, decoded }
       } catch (error) {
         session = null
         if (state) {
@@ -327,6 +338,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         if (params.reset) {
           session = await inBridgeContext(() => freshSession())
           blockedState = null
+          restoredState = null
         } else if (blockedState) {
           return {
             content: [{ type: 'text', text: blockedState.error + '\nNo code ran. Use reset=true to discard the saved state explicitly.' }],
@@ -356,7 +368,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         if (params.resume && params.abandon) {
           return {
             content: [{ type: 'text', text: '(choose either resume=true or abandon=true, not both)' }],
-            details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
+            details: { status: 'error', state: savedState(session), calls: [] } satisfies PythonDetails,
           }
         }
 
@@ -369,7 +381,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
                 text: abandoned ? '(suspended script abandoned)' : '(nothing is suspended)',
               },
             ],
-            details: { status: 'ok', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
+            details: { status: 'ok', state: savedState(session), calls: [] } satisfies PythonDetails,
           }
         }
 
@@ -392,7 +404,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           if (!session.suspendedCode) {
             return {
               content: [{ type: 'text', text: '(nothing is suspended; run code normally)' }],
-              details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
+              details: { status: 'error', state: savedState(session), calls: [] } satisfies PythonDetails,
             }
           }
           result = await inBridgeContext(() => session!.resume(runOptions))
@@ -407,13 +419,13 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
                     'discard it with {"abandon": true}, or reset=true; new code was not run)',
                 },
               ],
-              details: { status: 'suspended', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
+              details: { status: 'suspended', state: savedState(session), calls: [] } satisfies PythonDetails,
             }
           }
           if (params.code === undefined) {
             return {
               content: [{ type: 'text', text: '(code is required unless resume=true)' }],
-              details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
+              details: { status: 'error', state: savedState(session), calls: [] } satisfies PythonDetails,
             }
           }
           result = await inBridgeContext(() => session!.run(params.code!, runOptions))
@@ -454,7 +466,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           content: [{ type: 'text', text: finalText }],
           details: {
             status: result.status,
-            state: encodeSessionState(session.dump()),
+            state: savedState(session),
             calls: result.calls.map((c) => c.tool),
           } satisfies PythonDetails,
         }

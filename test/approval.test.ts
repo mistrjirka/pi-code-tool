@@ -329,7 +329,7 @@ f"{a}|{x}|{y}"`
     expect(executions).toHaveLength(0)
   })
 
-  it('dumps native version-3 state and explicitly rejects legacy replay snapshots', async () => {
+  it('dumps native version-3 state and imports pending legacy approvals', async () => {
     const session = new Session()
     await session.run('x = 1')
     expect(JSON.parse(session.dump()).version).toBe(3)
@@ -338,8 +338,15 @@ f"{a}|{x}|{y}"`
         version, snippets: [{ code: 'y = 41' }], calls: [], stdout: '',
         suspended: { code: 'deploy("prod")', cacheLen: 0 },
       })
-      expect(() => Session.load(legacy)).toThrow(/cannot safely restore.*legacy/)
-      expect(() => Session.load(legacy)).toThrow(/reset=true/)
+      const { tool, executions } = gatedTool()
+      const restored = Session.load(legacy, { tools: [tool] })
+      expect(restored.dump()).toBe(legacy)
+      const resumed = await restored.resume({ onApproval: () => true })
+      expect(resumed.status, resumed.error).toBe('ok')
+      expect(resumed.output).toBe('deployed to prod')
+      expect(executions).toHaveLength(1)
+      expect(JSON.parse(restored.dump()).version).toBe(3)
+      expect((await restored.run('y + 1')).output).toBe(42)
     }
   })
 })

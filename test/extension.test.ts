@@ -1,3 +1,5 @@
+import { gzipSync } from 'node:zlib'
+import { decodeSessionState } from '../src/pi/state-codec.js'
 import { describe, expect, it } from 'vitest'
 import { APPROVAL_CHOICES, createPythonExtension } from '../src/pi/extension.js'
 import type { HostTool } from '../src/index.js'
@@ -429,5 +431,60 @@ describe('python pi extension', () => {
     const result = await tool.execute('t2', { code: 'x' })
     expect(result.details.status).not.toBe('ok')
     expect(result.content[0].text).toContain('not defined')
+  })
+})
+
+describe('legacy extension state retention', () => {
+  it.each(['plain', 'gzip'])('preserves exact %s bytes after lazy reconstruction fails', async (format) => {
+    let effects = 0
+    const effect: HostTool = {
+      name: 'effect', description: 'effect', params: [], returns: 'int',
+      execute: () => ++effects,
+    }
+    const { tool, handlers } = await loadExtension({ tools: [effect], noBuiltins: true, bridgePiTools: false })
+    const raw = JSON.stringify({
+      version: 2, snippets: [{ code: 'raise AssertionError("missing old observation")' }],
+      calls: [], stdout: '',
+    }, null, 2)
+    const encoded = format === 'plain' ? raw :
+      'pi-code-tool:gzip-v1:' + gzipSync(raw, { level: 9 }).toString('base64')
+    const start = handlers.get('session_start')![0]
+    start({}, { sessionManager: { getBranch: () => [
+      { type: 'message', message: { toolName: 'code', details: { state: encoded } } },
+    ] } })
+    const failed = await tool.execute('failed', { code: 'effect()' })
+    expect(failed.details.status).toBe('error')
+    expect(failed.content[0].text).toContain('AssertionError')
+    expect(failed.details.state).toBe(encoded)
+    expect(effects).toBe(0)
+    const retry = await tool.execute('retry', { code: 'effect()' })
+    expect(retry.details.state).toBe(encoded)
+    expect(effects).toBe(0)
+    const reset = await tool.execute('reset', { reset: true, code: 'effect()' })
+    expect(reset.details.status).toBe('ok')
+    expect(effects).toBe(1)
+    expect(JSON.parse(decodeSessionState(String(reset.details.state))).version).toBe(3)
+  })
+
+  it('persists explicit legacy abandonment instead of returning the old paused encoding', async () => {
+    const { tool, handlers } = await loadExtension({ noBuiltins: true, bridgePiTools: false })
+    const raw = JSON.stringify({
+      version: 1, snippets: [{ code: 'kept = 7' }], calls: [], stdout: '',
+      suspended: { code: 'unavailable_pending_tool()', cacheLen: 0 },
+    })
+    const encoded = 'pi-code-tool:gzip-v1:' + gzipSync(raw, { level: 9 }).toString('base64')
+    const start = handlers.get('session_start')![0]
+    const restore = (value: unknown) => start({}, { sessionManager: { getBranch: () => [
+      { type: 'message', message: { toolName: 'code', details: { state: value } } },
+    ] } })
+    restore(encoded)
+    const abandoned = await tool.execute('abandon', { abandon: true })
+    expect(abandoned.details.status).toBe('ok')
+    expect(abandoned.details.state).not.toBe(encoded)
+    expect(JSON.parse(decodeSessionState(String(abandoned.details.state))).suspended).toBeUndefined()
+    restore(abandoned.details.state)
+    const result = await tool.execute('kept', { code: 'kept' })
+    expect(result.content[0].text).toBe('=> 7')
+    expect(JSON.parse(decodeSessionState(String(result.details.state))).version).toBe(3)
   })
 })
