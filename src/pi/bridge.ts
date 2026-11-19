@@ -1,9 +1,7 @@
 /**
- * Bridges pi's own built-in tools (read/grep/find/ls and, gated behind
- * approval, bash/edit/write) into the sandbox as plain Python functions —
- * the Cloudflare "code mode" conversion: tool schema → typed stub. The model
- * can then loop/filter/compose pi's real tools in one snippet instead of one
- * model round-trip per call.
+ * Bridges pi's tools into Python helpers. In an AgentSession, calls go through
+ * the session's registered tools and their validation, hooks, and cancellation.
+ * Standalone and older Pi callers retain the built-in tool fallback.
  */
 import {
   createBashTool,
@@ -17,19 +15,26 @@ import {
 import { HostToolError } from '../core/types.js'
 import type { HostTool, HostToolParam } from '../core/types.js'
 
-/** The slice of pi's AgentTool the bridge relies on. */
-interface PiTool {
+interface PiToolResult {
+  content: ({ type: string } & Record<string, unknown>)[]
+}
+
+/** Structural types also allow this package to build against older Pi SDKs. */
+export interface PiBridgeTool {
   name: string
   description: string
   parameters: {
     properties?: Record<string, JsonSchema>
     required?: string[]
   }
+}
+
+interface PiTool extends PiBridgeTool {
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
     signal?: AbortSignal,
-  ) => Promise<{ content: ({ type: string } & Record<string, unknown>)[] }>
+  ) => Promise<PiToolResult>
 }
 
 interface JsonSchema {
@@ -39,59 +44,122 @@ interface JsonSchema {
   enum?: unknown[]
 }
 
+export interface PiBridgeContext {
+  /** Callable registered tools. An empty list must not enable built-in fallbacks. */
+  tools?: readonly PiBridgeTool[]
+  executeTool?: (
+    name: string,
+    args: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
+  ) => Promise<{ result: PiToolResult; isError: boolean }>
+  signal?: AbortSignal
+}
+
 export interface BridgeOptions {
   /** Gate bash/edit/write behind per-call approval. Default true. */
   gateMutating?: boolean
+  /** The active code execution, scoped by the extension rather than shared globally. */
+  getContext?: () => PiBridgeContext | undefined
+  /** Prevent a custom code-tool name from calling itself through a helper. */
+  exclude?: string
+}
+
+/** Capture the current session dispatcher, or explicitly use the older-Pi fallback. */
+export function piBridgeContext(ctx: unknown, signal?: AbortSignal): PiBridgeContext {
+  if (ctx && typeof ctx === 'object' && 'executeTool' in ctx && typeof ctx.executeTool === 'function') {
+    const current = ctx as Required<Pick<PiBridgeContext, 'executeTool' | 'tools'>>
+    return {
+      get tools() { return current.tools ?? [] },
+      executeTool: (name, args, options) => current.executeTool(name, args, options),
+      signal,
+    }
+  }
+  return { signal }
 }
 
 /**
- * Wraps pi's built-in tools as host tools for the sandbox. Read-only tools
- * (read, grep, find, ls) dispatch directly; mutating tools (bash, edit,
- * write) carry requiresApproval so each call pauses for a human decision.
+ * Mutating helpers keep per-call approval. Registered schemas are read in the
+ * active execution so overrides and changed loadouts do not use stale stubs.
  */
 export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): HostTool[] {
   const gate = options.gateMutating ?? true
   const readOnly = [createReadTool, createGrepTool, createFindTool, createLsTool]
   const mutating = [createBashTool, createEditTool, createWriteTool]
   return [
-    ...readOnly.map((factory) => wrapPiTool(factory(cwd) as unknown as PiTool, false)),
-    ...mutating.map((factory) => wrapPiTool(factory(cwd) as unknown as PiTool, gate)),
-  ]
+    ...readOnly.map((factory) => wrapPiTool(factory(cwd) as unknown as PiTool, false, options)),
+    ...mutating.map((factory) => wrapPiTool(factory(cwd) as unknown as PiTool, gate, options)),
+  ].filter((tool) => tool.name !== options.exclude)
 }
 
-function wrapPiTool(tool: PiTool, requiresApproval: boolean): HostTool {
-  const params = schemaToParams(tool.parameters)
-  const positional = params.map((p) => p.name)
+function wrapPiTool(tool: PiTool, requiresApproval: boolean, options: BridgeOptions): HostTool {
+  const currentTool = () => options.getContext?.()?.tools?.find((entry) => entry.name === tool.name) ?? tool
   let counter = 0
   return {
     name: tool.name,
-    description: firstSentences(tool.description),
-    params,
+    get description() { return firstSentences(currentTool().description) },
+    get params() { return schemaToParams(currentTool().parameters) },
     returns: 'str',
     returnsDescription: piToolReturnsDescription(tool.name),
     requiresApproval,
     async execute(args, kwargs) {
+      const context = options.getContext?.()
+      const registered = context?.tools?.find((entry) => entry.name === tool.name)
+      if (context?.executeTool && !registered) {
+        throw new HostToolError(`Tool '${tool.name}' is not callable in this session`, 'PermissionError')
+      }
+      const positional = schemaToParams((registered ?? tool).parameters).map((param) => param.name)
       const input: Record<string, unknown> = {}
       args.forEach((value, index) => {
         const name = positional[index]
         if (!name) throw new HostToolError(`${tool.name} takes at most ${positional.length} arguments`, 'TypeError')
-        input[name] = value
+        Object.defineProperty(input, name, { value: normalizePiToolValue(value), enumerable: true, writable: true, configurable: true })
       })
       for (const [key, value] of Object.entries(kwargs)) {
-        if (key in input) throw new HostToolError(`got multiple values for argument '${key}'`, 'TypeError')
-        input[key] = value
+        if (Object.hasOwn(input, key)) throw new HostToolError(`got multiple values for argument '${key}'`, 'TypeError')
+        Object.defineProperty(input, key, { value: normalizePiToolValue(value), enumerable: true, writable: true, configurable: true })
       }
-      let result: Awaited<ReturnType<PiTool['execute']>>
+      let result: PiToolResult
       try {
-        result = await tool.execute(`bridge-${tool.name}-${counter++}`, input)
-      } catch (e) {
-        throw new HostToolError((e as Error).message, 'RuntimeError')
+        if (context?.executeTool) {
+          const outcome = await context.executeTool(tool.name, input, { signal: context.signal })
+          if (outcome.isError) throw new HostToolError(resultText(outcome.result), 'RuntimeError')
+          result = outcome.result
+        } else {
+          // No session dispatcher exists in older Pi or standalone bridge use.
+          result = await tool.execute(`bridge-${tool.name}-${counter++}`, input, context?.signal)
+        }
+      } catch (error) {
+        if (error instanceof HostToolError) throw error
+        throw new HostToolError(error instanceof Error ? error.message : String(error), 'RuntimeError')
       }
-      return result.content
-        .map((block) => (block.type === 'text' ? String(block.text ?? '') : `[${block.type}]`))
-        .join('\n')
+      return resultText(result)
     },
   }
+}
+
+function resultText(result: PiToolResult): string {
+  return result.content
+    .map((block) => (block.type === 'text' ? String(block.text ?? '') : `[${block.type}]`))
+    .join('\n')
+}
+
+/** Monty returns Python dictionaries as Maps, while Pi validates JSON objects. */
+export function normalizePiToolValue(value: unknown): unknown {
+  if (value instanceof Map) {
+    const entries: [string, unknown][] = []
+    for (const [key, item] of value) {
+      if (typeof key !== 'string') {
+        throw new HostToolError('Tool dictionaries require string keys', 'TypeError')
+      }
+      entries.push([key, normalizePiToolValue(item)])
+    }
+    return Object.fromEntries(entries)
+  }
+  if (Array.isArray(value)) return value.map(normalizePiToolValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizePiToolValue(item)]))
+  }
+  return value
 }
 
 const PI_TOOL_RETURN_DESCRIPTIONS: Record<string, string> = {
@@ -110,7 +178,7 @@ function piToolReturnsDescription(name: string): string {
   return PI_TOOL_RETURN_DESCRIPTIONS[name] ?? `text output from pi's ${name} tool; inspect it before parsing if uncertain`
 }
 
-function schemaToParams(schema: PiTool['parameters']): HostToolParam[] {
+function schemaToParams(schema: PiBridgeTool['parameters']): HostToolParam[] {
   const required = new Set(schema.required ?? [])
   return Object.entries(schema.properties ?? {}).map(([name, prop]) => ({
     name,

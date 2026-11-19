@@ -15,6 +15,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { MountDir } from '@pydantic/monty'
@@ -23,7 +24,8 @@ import { renderPythonToolRules, ToolRegistry } from '../core/registry.js'
 import { createBuiltinTools } from '../core/builtins.js'
 import { Session } from '../core/session.js'
 import { ToolStore } from '../core/toolstore.js'
-import { createPiBridgeTools } from './bridge.js'
+import { createPiBridgeTools, normalizePiToolValue, piBridgeContext } from './bridge.js'
+import type { PiBridgeContext, PiBridgeTool } from './bridge.js'
 import { decodeSessionState, encodeSessionState } from './state-codec.js'
 import type { ApprovalRequest, HostTool, RunLimits, RunResult } from '../core/types.js'
 
@@ -135,9 +137,13 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     }
     const bridge = options.bridgePiTools ?? true
     const registry = new ToolRegistry(options.tools)
-    if (bridge) {
-      for (const tool of createPiBridgeTools(root)) registry.add(tool)
-    }
+    const bridgeExecution = new AsyncLocalStorage<PiBridgeContext>()
+    const bridgeTools = bridge ? createPiBridgeTools(root, {
+      getContext: () => bridgeExecution.getStore(),
+      exclude: toolName,
+    }) : []
+    const bridgeNames = new Set(bridgeTools.map((tool) => tool.name))
+    for (const tool of bridgeTools) registry.add(tool)
     if (!options.noBuiltins) {
       // the mount replaces read_file with plain open(); bridged ls replaces list_files
       for (const tool of createBuiltinTools({ root, readFile: !makeMount, listFiles: !bridge })) {
@@ -163,11 +169,6 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
       }
     }
     const savedSummary = store ? await store.renderSummary() : ''
-    const gatedNames = registry
-      .list()
-      .filter((t) => t.requiresApproval)
-      .map((t) => t.name)
-
     const sessionOptions = { tools: registry, limits: options.limits, typeCheck: options.typeCheck }
     // null until first use: a fresh session loads saved tools as a prelude,
     // which is async, so creation happens lazily in execute().
@@ -236,10 +237,9 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
       restoredUnverified = Boolean(state)
     })
 
-    pi.registerTool({
-      name: toolName,
-      label: 'Code',
-      description: [
+    function describe(visibleRegistry: ToolRegistry = registry): string {
+      const gatedNames = visibleRegistry.list().filter((tool) => tool.requiresApproval).map((tool) => tool.name)
+      return [
         'Run Python in a sandboxed interpreter with host tools available as plain',
         'functions. Variables and functions persist across calls in this session.',
         'Prefer this tool when you need to chain tool calls, loop, filter large',
@@ -249,7 +249,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         `- These names are NOT standalone pi tools; they only exist in Python code passed to ${toolName}.`,
         `- Example: call ${toolName} with code like \`print(ls("."))\`; do not try to invoke \`ls\` as a separate pi tool.`,
         '',
-        registry.renderStubs(),
+        visibleRegistry.renderStubs(),
         ...(savedSummary
           ? [
               '',
@@ -271,7 +271,28 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
               `- The workspace is mounted READ-ONLY at /workspace: read files with open("/workspace/<path>") or pathlib. Helper-tool paths such as ls/find results are relative to the workspace root. Files are not iterable — use .read()/.readlines(); parse JSON with json.loads(text). Writes raise PermissionError; change real files with the regular edit/write tools.`,
             ]
           : []),
-      ].join('\n'),
+      ].join('\n')
+    }
+
+    // New Pi versions provide the callable loadout before each model request.
+    // Older versions ignore this optional hook and keep the standalone stubs.
+    const loadoutHooks = bridge ? {
+      prepareLoadout(loadout: { callable: readonly PiBridgeTool[] }) {
+        const callable = new Set(loadout.callable.map((tool) => tool.name))
+        const visible = new ToolRegistry(registry.list().filter(
+          (tool) => !bridgeNames.has(tool.name) || callable.has(tool.name),
+        ))
+        return bridgeExecution.run({ tools: loadout.callable }, () => ({
+          descriptions: { [toolName]: describe(visible) },
+        }))
+      },
+    } : {}
+
+    pi.registerTool({
+      name: toolName,
+      label: 'Code',
+      description: describe(),
+      ...loadoutHooks,
       promptSnippet: `${toolName}: run sandboxed Python; host tools are callable as functions; state persists`,
       promptGuidelines: [
         `Use ${toolName} for multi-step tool workflows: loop/filter/aggregate in code and print only the result, instead of issuing many separate tool calls.`,
@@ -293,8 +314,10 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
       ],
       parameters: PythonParams,
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        const inBridgeContext = <T>(run: () => Promise<T>) =>
+          bridgeExecution.run(piBridgeContext(ctx, signal), run)
         if (params.reset || !session) {
-          session = await freshSession()
+          session = await inBridgeContext(() => freshSession())
           restoredUnverified = false
         }
 
@@ -352,7 +375,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         let result: RunResult
         if (params.resume) {
           try {
-            result = await session.resume(runOptions)
+            result = await inBridgeContext(() => session!.resume(runOptions))
           } catch {
             return {
               content: [{ type: 'text', text: '(nothing is suspended — run code normally)' }],
@@ -379,7 +402,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
               details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
             }
           }
-          result = await session.run(params.code, runOptions)
+          result = await inBridgeContext(() => session!.run(params.code!, runOptions))
         }
 
         const abandonNote = abandoned
@@ -439,7 +462,7 @@ function formatNameList(names: string[]): string {
 
 function formatValue(value: unknown): string {
   try {
-    return JSON.stringify(value) ?? String(value)
+    return JSON.stringify(normalizePiToolValue(value)) ?? String(value)
   } catch {
     return String(value)
   }
