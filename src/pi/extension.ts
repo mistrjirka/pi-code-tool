@@ -24,6 +24,7 @@ import { createBuiltinTools } from '../core/builtins.js'
 import { Session } from '../core/session.js'
 import { ToolStore } from '../core/toolstore.js'
 import { createPiBridgeTools } from './bridge.js'
+import { decodeSessionState, encodeSessionState } from './state-codec.js'
 import type { ApprovalRequest, HostTool, RunLimits, RunResult } from '../core/types.js'
 
 const DEFAULT_TOOL_NAME = 'code'
@@ -212,16 +213,20 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     // restores and branching.
     pi.on('session_start', (_event, ctx) => {
       let state: string | undefined
-      for (const entry of ctx.sessionManager.getBranch()) {
-        if (entry.type === 'message') {
-          const message = entry.message as { toolName?: string; details?: PythonDetails }
-          if (message.toolName === toolName && message.details?.state) {
-            state = message.details.state
-          }
+      // Walking backwards avoids reading every historical state snapshot.
+      // SessionManager can lazily load large tool-result details from disk.
+      const branch = ctx.sessionManager.getBranch()
+      for (let index = branch.length - 1; index >= 0; index--) {
+        const entry = branch[index]
+        if (entry?.type !== 'message') continue
+        const message = entry.message as { toolName?: string; details?: PythonDetails }
+        if (message.toolName === toolName && message.details?.state) {
+          state = message.details.state
+          break
         }
       }
       try {
-        session = state ? Session.load(state, sessionOptions) : null
+        session = state ? Session.load(decodeSessionState(state), sessionOptions) : null
       } catch {
         // unreadable state (e.g. written by an incompatible version): start
         // fresh rather than failing every session start
@@ -313,7 +318,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         if (params.resume && params.abandon) {
           return {
             content: [{ type: 'text', text: '(choose either resume=true or abandon=true, not both)' }],
-            details: { status: 'error', state: session.dump(), calls: [] } satisfies PythonDetails,
+            details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
           }
         }
 
@@ -326,7 +331,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
                 text: abandoned ? '(suspended script abandoned)' : '(nothing is suspended)',
               },
             ],
-            details: { status: 'ok', state: session.dump(), calls: [] } satisfies PythonDetails,
+            details: { status: 'ok', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
           }
         }
 
@@ -351,7 +356,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           } catch {
             return {
               content: [{ type: 'text', text: '(nothing is suspended — run code normally)' }],
-              details: { status: 'error', state: session.dump(), calls: [] } satisfies PythonDetails,
+              details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
             }
           }
         } else {
@@ -365,13 +370,13 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
                     'discard it with {"abandon": true}, or reset=true; new code was not run)',
                 },
               ],
-              details: { status: 'suspended', state: session.dump(), calls: [] } satisfies PythonDetails,
+              details: { status: 'suspended', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
             }
           }
           if (params.code === undefined) {
             return {
               content: [{ type: 'text', text: '(code is required unless resume=true)' }],
-              details: { status: 'error', state: session.dump(), calls: [] } satisfies PythonDetails,
+              details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
             }
           }
           result = await session.run(params.code, runOptions)
@@ -417,7 +422,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           content: [{ type: 'text', text: finalText }],
           details: {
             status: result.status,
-            state: session.dump(),
+            state: encodeSessionState(session.dump()),
             calls: result.calls.map((c) => c.tool),
           } satisfies PythonDetails,
         }

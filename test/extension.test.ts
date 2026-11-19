@@ -361,6 +361,32 @@ describe('python pi extension', () => {
     expect(result.content[0].text).toContain('not defined')
   })
 
+  it('restores only the newest snapshot without reading older lazy states', async () => {
+    const { tool, handlers } = await loadExtension({ noBuiltins: true, bridgePiTools: false })
+    const first = await tool.execute('t1', { code: 'previous_value = 7' })
+    expect(first.details.status).toBe('ok')
+    let oldStateReads = 0
+    const oldDetails = { status: 'ok' }
+    Object.defineProperty(oldDetails, 'state', {
+      enumerable: true,
+      get() {
+        oldStateReads += 1
+        throw new Error('An older state snapshot was unnecessarily read')
+      },
+    })
+    const sessionStart = handlers.get('session_start')![0]
+    sessionStart({}, {
+      sessionManager: { getBranch: () => [
+        { type: 'message', message: { toolName: 'code', details: oldDetails } },
+        { type: 'message', message: { toolName: 'code', details: first.details } },
+      ] },
+    })
+    expect(oldStateReads).toBe(0)
+    const restored = await tool.execute('t2', { code: 'previous_value + 1' })
+    expect(restored.content[0].text).toContain('=> 8')
+    expect(oldStateReads).toBe(0)
+  })
+
   it('restores session state from branch details on session_start', async () => {
     const { tool, handlers } = await loadExtension({ tools: [greet], noBuiltins: true })
     const first = await tool.execute('t1', { code: 'kept = greet("again")' })
