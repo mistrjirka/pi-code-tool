@@ -1,10 +1,11 @@
-import { Monty } from '@pydantic/monty'
+import { MontySyntaxError, MontyTypingError } from '@pydantic/monty/node'
+import { checkCode } from './runtime.js'
 import type { HostTool, HostToolParam } from './types.js'
 
 /** Holds host tools and renders the Python stubs the model sees. */
 export class ToolRegistry {
   private readonly tools = new Map<string, HostTool>()
-  private typeStubCache: string | null = null
+  private typeStubCache: { key: string; result: Promise<string> } | null = null
 
   constructor(tools: HostTool[] = []) {
     for (const tool of tools) this.add(tool)
@@ -39,17 +40,24 @@ export class ToolRegistry {
   }
 
   /**
-   * Compact stubs for monty's static type checker (`typeCheckPrefixCode`).
-   * Bodies must raise (`...` bodies trip ty's empty-body rule) and optional
-   * params default to None (`= ...` is only legal in .pyi stubs). Each stub
-   * is validated against ty itself: a tool whose param/return strings aren't
-   * real type expressions (they were prompt-only metadata before typeCheck
-   * existed) degrades to an unchecked `name: Any = None` declaration instead
-   * of poisoning the whole prefix. Cached until the next add().
+   * Type-only declarations for Monty's checker. Invalid legacy prose types
+   * fall back to Any for that tool. Interpreter/infrastructure failures do not
+   * disable checking. Cache keys include dynamic parameter and return types.
    */
-  renderTypeStubs(): string {
-    this.typeStubCache ??= this.list().map(validatedTypeStub).join('\n')
-    return this.typeStubCache
+  renderTypeStubs(): Promise<string> {
+    const tools = this.list().sort((a, b) => a.name.localeCompare(b.name, 'en'))
+    const stubs = tools.map((tool) => {
+      const params = renderParams(tool, (p) => ' | None = None')
+      return { name: tool.name, stub: 'def ' + tool.name + '(' + params + ') -> ' + tool.returns + ':\n    raise NotImplementedError' }
+    })
+    const key = JSON.stringify(stubs)
+    if (this.typeStubCache?.key !== key) {
+      this.typeStubCache = {
+        key,
+        result: Promise.all(stubs.map(({ name, stub }) => validatedTypeStub(name, stub))).then((values) => values.join('\n')),
+      }
+    }
+    return this.typeStubCache.result
   }
 }
 
@@ -59,15 +67,20 @@ function renderParams(tool: HostTool, optionalSuffix: (p: HostToolParam) => stri
     .join(', ')
 }
 
-function validatedTypeStub(tool: HostTool): string {
-  const params = renderParams(tool, (p) => ` | None = None`)
-  const stub = `def ${tool.name}(${params}) -> ${tool.returns}:\n    raise NotImplementedError`
-  try {
-    new Monty('pass', { typeCheck: true, typeCheckPrefixCode: stub })
-    return stub
-  } catch {
-    return `${tool.name}: Any = None`
+const validatedStubs = new Map<string, Promise<string>>()
+
+function validatedTypeStub(name: string, stub: string): Promise<string> {
+  let result = validatedStubs.get(stub)
+  if (!result) {
+    result = checkCode('pass', { typeCheck: true, stubs: stub })
+      .then(() => stub, (error: unknown) => {
+        if (error instanceof MontyTypingError || error instanceof MontySyntaxError) return name + ': Any'
+        throw error
+      })
+    if (validatedStubs.size >= 256) validatedStubs.delete(validatedStubs.keys().next().value!)
+    validatedStubs.set(stub, result)
   }
+  return result
 }
 
 /**

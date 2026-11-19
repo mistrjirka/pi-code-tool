@@ -2,26 +2,24 @@ import { describe, expect, it } from 'vitest'
 import { probeImportableModules } from '../src/index.js'
 
 describe('probeImportableModules', () => {
-  it('reports real interpreter capabilities', () => {
-    const modules = probeImportableModules()
+  it('reports real interpreter capabilities', async () => {
+    const modules = await probeImportableModules()
     expect(modules).toContain('json')
     expect(modules).toContain('re')
     expect(modules).toContain('pathlib')
-    expect(modules).not.toContain('time') // not in monty 0.0.18
+    expect(modules).toContain('time') // supported by the pinned Monty 1.0.0
   })
 
-  it('respects a custom candidate list', () => {
-    expect(probeImportableModules(['json', 'definitely_not_a_module'])).toEqual(['json'])
+  it('respects a custom candidate list', async () => {
+    expect(await probeImportableModules(['json', 'definitely_not_a_module'])).toEqual(['json'])
   })
 })
 
 import { probeTypeCheckerGaps, renderPythonToolRules } from '../src/index.js'
 
 describe('probeTypeCheckerGaps', () => {
-  it('finds runtime names ty rejects', () => {
-    const gaps = probeTypeCheckerGaps()
-    expect(gaps).toContain('open') // known gap on monty 0.0.18
-    expect(probeTypeCheckerGaps(['len'])).toEqual([]) // ty knows len
+  it('finds unresolved names without executing candidate code', async () => {
+    expect(await probeTypeCheckerGaps(['len', '__missing_runtime_name__'])).toEqual(['__missing_runtime_name__'])
   })
 })
 

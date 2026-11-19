@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { Monty, MontySyntaxError } from '@pydantic/monty'
+import { MontySyntaxError } from '@pydantic/monty/node'
+import { checkCode } from './runtime.js'
 import { arg, requireString } from './args.js'
 import { HostToolError } from './types.js'
 import type { HostTool } from './types.js'
@@ -57,7 +58,7 @@ export class ToolStore {
       throw new HostToolError(`'${name}' is not a valid Python identifier`, 'ValueError')
     }
     try {
-      new Monty(code, { scriptName: `${name}.py` })
+      await checkCode(code, { scriptName: `${name}.py` })
     } catch (e) {
       if (e instanceof MontySyntaxError) {
         throw new HostToolError(`code has a syntax error: ${e.display('msg')}`, 'ValueError')

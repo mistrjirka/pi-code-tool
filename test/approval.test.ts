@@ -329,33 +329,17 @@ f"{a}|{x}|{y}"`
     expect(executions).toHaveLength(0)
   })
 
-  it('dumps version-2 state and still loads version-1 state', async () => {
+  it('dumps native version-3 state and explicitly rejects legacy replay snapshots', async () => {
     const session = new Session()
     await session.run('x = 1')
-    expect(JSON.parse(session.dump()).version).toBe(2)
-
-    const v1 = JSON.stringify({
-      version: 1,
-      snippets: [{ code: 'y = 41' }],
-      calls: [],
-      stdout: '',
-    })
-    const restored = Session.load(v1)
-    expect((await restored.run('y + 1')).output).toBe(42)
-
-    // a v0.4.x suspension (no stdout/key fields) still resumes
-    const { tool: gated, executions } = gatedTool()
-    const v1Suspended = JSON.stringify({
-      version: 1,
-      snippets: [],
-      calls: [],
-      stdout: '',
-      suspended: { code: 'deploy("prod")', cacheLen: 0 },
-    })
-    const withSuspension = Session.load(v1Suspended, { tools: [gated] })
-    expect(withSuspension.suspendedCode).toBe('deploy("prod")')
-    const resumed = await withSuspension.resume({ onApproval: () => true })
-    expect(resumed.status).toBe('ok')
-    expect(executions).toHaveLength(1)
+    expect(JSON.parse(session.dump()).version).toBe(3)
+    for (const version of [1, 2]) {
+      const legacy = JSON.stringify({
+        version, snippets: [{ code: 'y = 41' }], calls: [], stdout: '',
+        suspended: { code: 'deploy("prod")', cacheLen: 0 },
+      })
+      expect(() => Session.load(legacy)).toThrow(/cannot safely restore.*legacy/)
+      expect(() => Session.load(legacy)).toThrow(/reset=true/)
+    }
   })
 })

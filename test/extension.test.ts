@@ -51,8 +51,8 @@ describe('python pi extension', () => {
     expect(tool.description).toContain('ONLY these modules exist:')
     expect(tool.description).toMatch(/exist:.*\bjson\b/)
     expect(tool.description).toMatch(/exist:.*\bpathlib\b/)
-    // time isn't importable in monty 0.0.18 — it must only appear as a counterexample
-    expect(tool.description).not.toMatch(/exist:[^\n]*\btime\b/)
+    // The pinned Monty 1.0.0 supports time, so the live rules include it.
+    expect(tool.description).toMatch(/exist:[^\n]*\btime\b/)
   })
 
   it('honors a custom tool name', async () => {
@@ -280,7 +280,7 @@ describe('python pi extension', () => {
     expect(guidelines).not.toContain('list_files')
   })
 
-  it('hints at reset when a restored session fails its first run', async () => {
+  it('preserves valid restored state after an ordinary code error without suggesting a reset', async () => {
     const { tool, handlers } = await loadExtension({ noBuiltins: true })
     const first = await tool.execute('t1', { code: 'kept = 1' })
 
@@ -297,10 +297,12 @@ describe('python pi extension', () => {
     )
 
     const failed = await tool.execute('t2', { code: 'missing_name' })
-    expect(failed.content[0].text).toContain('retry with reset=true')
-    // the hint is one-shot
+    expect(failed.content[0].text).toContain('missing_name')
+    expect(failed.content[0].text).not.toContain('reset=true')
+    expect(failed.details.state).toBe(first.details.state)
     const failedAgain = await tool.execute('t3', { code: 'missing_name' })
-    expect(failedAgain.content[0].text).not.toContain('retry with reset=true')
+    expect(failedAgain.content[0].text).not.toContain('reset=true')
+    expect((await tool.execute('t4', { code: 'kept' })).content[0].text).toBe('=> 1')
   })
 
   it('persists unchanged state for ordinary failed runs', async () => {

@@ -1,23 +1,20 @@
+import { createHash } from 'node:crypto'
 import {
-  Monty,
+  FunctionSnapshot,
   MontyComplete,
-  MontyNameLookup,
+  MontyCrashedError,
   MontyRuntimeError,
-  MontySnapshot,
   MontySyntaxError,
   MontyTypingError,
-} from '@pydantic/monty'
-import type { ResourceLimits } from '@pydantic/monty'
+  NameLookupSnapshot,
+} from '@pydantic/monty/node'
+import type { Snapshot } from '@pydantic/monty/node'
 import { probeTypeCheckerGaps } from './capabilities.js'
 import { ToolRegistry } from './registry.js'
+import { checkCheckpointSize, normalizeLimits, withInterpreter } from './runtime.js'
 import { DEFAULT_MAX_STDOUT_BYTES, appendCappedUtf8 } from './stdout.js'
 import { HostToolError } from './types.js'
 import type { ApprovalRequest, HostTool, RunErrorKind, RunLimits, RunOptions, RunResult, ToolCallTrace } from './types.js'
-
-const DEFAULT_LIMITS: Required<Pick<RunLimits, 'maxDurationSecs' | 'maxMemory'>> = {
-  maxDurationSecs: 5,
-  maxMemory: 64 * 1024 * 1024,
-}
 
 const PYTHON_KEYWORDS = new Set([
   'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break',
@@ -26,48 +23,39 @@ const PYTHON_KEYWORDS = new Set([
   'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield',
 ])
 
-// probed once per process; names land verbatim in the typecheck prefix
-let typeCheckerGaps: string[] | null = null
-
-/** Monty names calls through a resolved value after the JS function's `name`. */
-function namedPlaceholder(name: string): () => undefined {
-  const fn = () => undefined
-  Object.defineProperty(fn, 'name', { value: name })
-  return fn
-}
-
 export interface CodeRunnerOptions {
   tools?: HostTool[] | ToolRegistry
-  /** Default limits for every run; overridable per run. */
+  /** Default limits for each submitted snippet, excluding host-tool wait time. */
   limits?: RunLimits
-  /**
-   * Statically type-check code before executing it (monty's built-in `ty`),
-   * with registered tools and inputs declared as typed stubs. Catches wrong
-   * argument types, bad methods on tool results, and undefined names before
-   * any side effects run. Default true.
-   */
+  /** Check registered tool/input types before executing code. Default true. */
   typeCheck?: boolean
 }
 
-/**
- * Executes sandboxed Python with host tools exposed as plain functions.
- *
- * Owns the start/resume loop directly instead of using monty's `runMontyAsync`,
- * which masks Python runtime errors raised after a resume (it re-injects them
- * into the consumed snapshot — see docs/research/03-monty.md). Owning the loop
- * also gives us per-call tracing, abort checks between resumes, and host errors
- * raised into Python as catchable exceptions.
- */
+/** Internal handoff between the runner and the persistent Session. */
+export interface InterpreterCheckpoint {
+  kind: 'idle' | 'suspended'
+  bytes: Buffer
+}
+
+export interface CheckpointRun {
+  result: RunResult
+  checkpoint?: InterpreterCheckpoint
+  /** True only when retrying the old pending frame cannot repeat observed work. */
+  retrySuspension: boolean
+}
+
+/** Drives native persistent feeds, with approvals and tracing at every host call. */
 export class CodeRunner {
   readonly registry: ToolRegistry
   private readonly limits: RunLimits
   private readonly typeCheck: boolean
 
   constructor(options: CodeRunnerOptions = {}) {
-    this.limits = { ...DEFAULT_LIMITS, ...options.limits }
+    this.limits = options.limits ?? {}
     this.typeCheck = options.typeCheck ?? true
-    this.registry =
-      options.tools instanceof ToolRegistry ? options.tools : new ToolRegistry(options.tools)
+    this.registry = options.tools instanceof ToolRegistry
+      ? options.tools
+      : new ToolRegistry(options.tools)
   }
 
   addTool(tool: HostTool): void {
@@ -78,221 +66,247 @@ export class CodeRunner {
     return this.registry.list()
   }
 
+  /** Descriptions and tool-registration ordering do not affect compatibility. */
+  contract(options: RunOptions = {}): string {
+    const tools = this.registry.list().map((tool) => ({
+      name: tool.name,
+      params: tool.params.map((param) => ({
+        name: param.name,
+        type: param.type.trim(),
+        optional: param.optional ?? false,
+      })),
+      returns: tool.returns.trim(),
+    })).sort((a, b) => a.name.localeCompare(b.name, 'en'))
+    return createHash('sha256').update(JSON.stringify({
+      tools,
+      typeCheck: this.typeCheck,
+      limits: normalizeLimits({ ...this.limits, ...options.limits }),
+      scriptName: options.scriptName ?? 'tool.py',
+    })).digest('hex')
+  }
+
   async run(code: string, options: RunOptions = {}): Promise<RunResult> {
+    return (await this.execute(code, options)).result
+  }
+
+  async runCheckpoint(
+    code: string,
+    options: RunOptions,
+    initial: InterpreterCheckpoint | undefined,
+    maxCheckpointBytes: number,
+  ): Promise<CheckpointRun> {
+    return this.execute(code, options, initial, maxCheckpointBytes)
+  }
+
+  private async execute(
+    code: string,
+    options: RunOptions,
+    initial?: InterpreterCheckpoint,
+    maxCheckpointBytes?: number,
+  ): Promise<CheckpointRun> {
+    const inputNames = Object.keys(options.inputs ?? {})
+    for (const name of inputNames) {
+      if (!/^[a-z_][a-z0-9_]*$/i.test(name) || PYTHON_KEYWORDS.has(name)) {
+        throw new Error("Input name '" + name + "' is not a valid Python identifier")
+      }
+    }
     const calls: ToolCallTrace[] = []
     const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES
     let stdout = { text: '', bytes: 0, truncated: false }
+    let retrySuspension = initial?.kind === 'suspended'
+    let restoring = false
     const printCallback = (_stream: string, text: string) => {
+      if (text) retrySuspension = false
       options.onPrint?.(text)
       stdout = appendCappedUtf8(stdout, text, maxStdoutBytes)
-      // must not return a value: the native layer raises TypeError otherwise
+    }
+    const fail = (errorKind: RunErrorKind, error: string): CheckpointRun => ({
+      result: {
+        status: 'error', output: undefined, stdout: stdout.text,
+        stdoutTruncated: stdout.truncated, error, errorKind, calls,
+      },
+      retrySuspension,
+    })
+    const abort = () => fail('aborted', 'Run aborted by the host')
+    if (options.signal?.aborted) return abort()
+    if (initial?.kind === 'suspended' && inputNames.length > 0) {
+      return fail('state', 'A suspended frame retains its original inputs; resume without inputs or abandon it explicitly.')
     }
 
     const scriptName = options.scriptName ?? 'tool.py'
     const lineOffset = options.lineOffset ?? 0
-
-    const inputNames = options.inputs ? Object.keys(options.inputs) : []
-    for (const name of inputNames) {
-      if (!/^[a-z_][a-z0-9_]*$/i.test(name) || PYTHON_KEYWORDS.has(name)) {
-        throw new Error(`Input name '${name}' is not a valid Python identifier`)
-      }
-    }
-
-    // The type checker doesn't know tools, declared inputs, or some runtime
-    // builtins; feed all three in as prefix code, then shift reported line
-    // numbers back to the user's code.
-    const prefixLines: string[] = []
-    if (this.typeCheck) {
-      typeCheckerGaps ??= probeTypeCheckerGaps()
-      prefixLines.push('from typing import Any')
-      for (const name of [...typeCheckerGaps, ...inputNames]) {
-        prefixLines.push(`${name}: Any = None`)
-      }
-      const stubs = this.registry.renderTypeStubs()
-      if (stubs) prefixLines.push(stubs)
-    }
-    const prefix = prefixLines.join('\n')
-    const prefixLineCount = prefix === '' ? 0 : prefix.split('\n').length
-
-    const fail = (errorKind: RunErrorKind, error: string): RunResult => ({
-      status: 'error',
-      output: undefined,
-      stdout: stdout.text,
-      stdoutTruncated: stdout.truncated,
-      error,
-      errorKind,
-      calls,
-    })
-
-    const suspend = (request: ApprovalRequest): RunResult => ({
-      status: 'suspended',
-      output: undefined,
-      stdout: stdout.text,
-      stdoutTruncated: stdout.truncated,
-      error: `suspended awaiting approval of ${request.tool}(...)`,
-      suspendedCall: request,
-      calls,
-    })
-
     const locationRe = new RegExp(
-      `${scriptName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:(\\d+):`,
+      scriptName.replace(/[.*+?^{}()|[\]\\$]/g, '\\$&') + ':(\\d+):',
+      'g',
     )
-
-    const adjustLines = (diagnosticLines: string[]): string =>
-      diagnosticLines
-        .map((line) =>
-          line.replace(locationRe, (_m, raw) => `${scriptName}:${Number(raw) - prefixLineCount - lineOffset}:`),
-        )
-        .join('\n')
-
-    // Splits ty diagnostics into ones about the user's code vs ones pointing
-    // into our generated prefix (a host-side bug, e.g. a tool stub ty can't
-    // parse) — the model can't act on the latter.
-    const typingFailure = (e: MontyTypingError): RunResult | null => {
-      const lines = e
-        .displayDiagnostics('concise')
-        .split('\n')
-        .filter((line) => line.trim() !== '')
-      const userLines = lines.filter((line) => {
-        const match = locationRe.exec(line)
-        return !match || Number(match[1]) > prefixLineCount
-      })
-      if (userLines.length === 0) return null // all prefix-resident: degrade below
-      const kind = userLines.every((line) => line.includes('error[invalid-syntax]'))
-        ? 'syntax'
-        : 'typing'
-      return fail(kind, adjustLines(userLines))
+    const pythonFailure = (error: unknown): CheckpointRun => {
+      if (restoring) {
+        return fail('state', 'cannot safely restore the Python checkpoint: ' +
+          (error instanceof Error ? error.message : String(error)) +
+          '. The saved state was preserved. Use reset=true to start a new session.')
+      }
+      if (error instanceof MontyTypingError) {
+        const diagnostic = error.display().replace(locationRe,
+          (_match, line) => scriptName + ':' + (Number(line) - lineOffset) + ':')
+        const lines = diagnostic.split('\n').filter((line) => line.trim())
+        return fail(lines.every((line) => line.includes('error[invalid-syntax]')) ? 'syntax' : 'typing', diagnostic)
+      }
+      if (error instanceof MontySyntaxError) return fail('syntax', error.display('type-msg'))
+      if (error instanceof MontyRuntimeError) return fail('runtime', error.display('traceback'))
+      if (error instanceof MontyCrashedError) return fail('runtime', error.display('type-msg'))
+      return fail('runtime', error instanceof Error ? error.message : String(error))
     }
 
-    const pythonFailure = (e: unknown): RunResult => {
-      if (e instanceof MontyRuntimeError) return fail('runtime', e.display('traceback'))
-      if (e instanceof MontyTypingError) return typingFailure(e) ?? fail('typing', e.display())
-      if (e instanceof MontySyntaxError) return fail('syntax', e.display('type-msg'))
-      throw e
-    }
-
-    const montyOptions = {
-      scriptName,
-      inputs: inputNames.length > 0 ? inputNames : undefined,
-    }
-    let monty: Monty
     try {
-      monty = new Monty(code, {
-        ...montyOptions,
+      const gaps = this.typeCheck ? await probeTypeCheckerGaps() : []
+      const stubs = this.typeCheck ? [
+        'from typing import Any',
+        // Monty imports checker context between feeds. An unassigned export
+        // declaration retains private names without restricting later globals.
+        '__all__: list[str]',
+        ...gaps.map((name) => name + ': Any'),
+        await this.registry.renderTypeStubs(),
+      ].join('\n') : undefined
+      return await withInterpreter({
+        scriptName,
+        limits: normalizeLimits({ ...this.limits, ...options.limits }),
         typeCheck: this.typeCheck,
-        typeCheckPrefixCode: prefix || undefined,
-      })
-    } catch (e) {
-      if (e instanceof MontyTypingError) {
-        const failure = typingFailure(e)
-        if (failure) return failure
-        // every diagnostic pointed into the generated prefix — run unchecked
-        // rather than failing on code the model never wrote
+        typeCheckStubs: stubs,
+        typeCheckFormat: 'concise',
+      }, async (session) => {
         try {
-          monty = new Monty(code, montyOptions)
-        } catch (e2) {
-          return pythonFailure(e2)
-        }
-      } else {
-        return pythonFailure(e)
-      }
-    }
-
-    const limits = { ...this.limits, ...options.limits } as ResourceLimits
-    let progress: MontySnapshot | MontyNameLookup | MontyComplete
-    try {
-      progress = monty.start({ inputs: options.inputs, limits, printCallback, mount: options.mount })
-    } catch (e) {
-      return pythonFailure(e)
-    }
-
-    while (!(progress instanceof MontyComplete)) {
-      if (options.signal?.aborted) return fail('aborted', 'Run aborted by the host')
-
-      if (progress instanceof MontyNameLookup) {
-        const known = this.registry.has(progress.variableName)
-        try {
-          // A known tool referenced without being called (aliased, stored, passed
-          // around). Monty reports calls through the value under the JS function's
-          // `name`, so a placeholder named after the tool keeps dispatch working.
-          progress = known
-            ? progress.resume({ value: namedPlaceholder(progress.variableName) })
-            : progress.resume()
-        } catch (e) {
-          return pythonFailure(e)
-        }
-        continue
-      }
-
-      const snapshot: MontySnapshot = progress
-      const tool = this.registry.get(snapshot.functionName)
-      let resumeArg: Parameters<MontySnapshot['resume']>[0]
-      if (!tool) {
-        resumeArg = {
-          exception: {
-            type: 'NameError',
-            message: `name '${snapshot.functionName}' is not defined`,
-          },
-        }
-      } else {
-        const trace: ToolCallTrace = {
-          tool: tool.name,
-          args: snapshot.args,
-          kwargs: snapshot.kwargs,
-          durationMs: 0,
-          ok: false,
-        }
-        const startedAt = performance.now()
-        let denial: string | null = null
-        if (tool.requiresApproval) {
-          const request = {
-            tool: tool.name,
-            args: snapshot.args,
-            kwargs: snapshot.kwargs,
-            description: tool.description,
-          }
-          if (!options.onApproval) {
-            trace.approved = false
-            denial = `${tool.name} requires approval but no approver is configured`
+          let progress: Snapshot
+          if (initial?.kind === 'suspended') {
+            restoring = true
+            progress = await session.loadSnapshot(initial.bytes, { printCallback, mount: options.mount })
+            restoring = false
           } else {
-            // the script is frozen at this call while the human decides
-            const decision = await options.onApproval(request)
-            if (decision === 'suspend') {
-              // stop before the call executes; everything that DID execute is
-              // in `calls`, so Session.resume() can replay up to here
-              return suspend(request)
+            if (initial) {
+              restoring = true
+              await session.loadSession(initial.bytes)
+              restoring = false
             }
-            trace.approved = decision
-            if (!decision) denial = `${tool.name} call denied by the user`
+            // Declarations only. They teach the persistent checker about newly
+            // injected inputs without rewriting or executing the user's source.
+            if (this.typeCheck && inputNames.length > 0) {
+              await session.feedRun(
+                'from typing import Any\n' + inputNames.map((name) => name + ': Any').join('\n'),
+                { printCallback: () => {} },
+              )
+            }
+            if (options.signal?.aborted) return abort()
+            progress = await session.feedStart(code, {
+              inputs: options.inputs,
+              printCallback,
+              mount: options.mount,
+            })
           }
-        }
-        if (denial !== null) {
-          trace.error = `PermissionError: ${denial}`
-          resumeArg = { exception: { type: 'PermissionError', message: denial } }
-        } else {
-          try {
-            const result = await tool.execute(snapshot.args, snapshot.kwargs)
-            trace.ok = true
-            resumeArg = { returnValue: result }
-          } catch (e) {
-            const err = e instanceof Error ? e : new Error(String(e))
-            const pythonType = err instanceof HostToolError ? err.pythonType : 'RuntimeError'
-            trace.error = `${pythonType}: ${err.message}`
-            resumeArg = { exception: { type: pythonType, message: err.message } }
-          }
-        }
-        trace.durationMs = performance.now() - startedAt
-        calls.push(trace)
-      }
 
-      if (options.signal?.aborted) return fail('aborted', 'Run aborted by the host')
-      try {
-        progress = snapshot.resume(resumeArg)
-      } catch (e) {
-        return pythonFailure(e)
-      }
+          while (!(progress instanceof MontyComplete)) {
+            if (options.signal?.aborted) return abort()
+            if (progress instanceof NameLookupSnapshot) {
+              progress = await progress.resume(
+                this.registry.has(progress.variableName) ? progress.variableName : undefined,
+              )
+              continue
+            }
+            if (!(progress instanceof FunctionSnapshot)) {
+              return fail('runtime', 'Unexpected unresolved Python future; no host future was registered')
+            }
+            if (progress.isOsFunction) {
+              // Mount handling stays native and uses only this run's mounts.
+              retrySuspension = false
+              progress = await progress.resumeAuto()
+              continue
+            }
+            const snapshot: FunctionSnapshot = progress
+            const tool = this.registry.get(snapshot.functionName)
+            if (!tool) {
+              progress = await snapshot.resumeNotFound()
+              continue
+            }
+            const trace: ToolCallTrace = {
+              tool: tool.name, args: snapshot.args, kwargs: snapshot.kwargs,
+              durationMs: 0, ok: false,
+            }
+            const startedAt = performance.now()
+            let denial: string | undefined
+            if (tool.requiresApproval) {
+              const request: ApprovalRequest = {
+                tool: tool.name, args: snapshot.args, kwargs: snapshot.kwargs,
+                description: tool.description,
+              }
+              const decision = options.onApproval ? await options.onApproval(request) : false
+              if (options.signal?.aborted) return abort()
+              if (decision === 'suspend') {
+                let checkpoint: InterpreterCheckpoint | undefined
+                if (maxCheckpointBytes !== undefined) {
+                  const bytes = await snapshot.dump()
+                  checkCheckpointSize(bytes, maxCheckpointBytes)
+                  checkpoint = { kind: 'suspended', bytes }
+                }
+                return {
+                  result: {
+                    status: 'suspended', output: undefined, stdout: stdout.text,
+                    stdoutTruncated: stdout.truncated, calls, suspendedCall: request,
+                    error: 'suspended awaiting approval of ' + tool.name + '(...)',
+                  },
+                  checkpoint,
+                  retrySuspension: false,
+                }
+              }
+              trace.approved = decision
+              if (!decision) denial = options.onApproval
+                ? tool.name + ' call denied by the user'
+                : tool.name + ' requires approval but no approver is configured'
+            }
+
+            let value: unknown
+            let error: MontyRuntimeError | undefined
+            if (denial) {
+              trace.error = 'PermissionError: ' + denial
+              error = new MontyRuntimeError('PermissionError', denial)
+            } else {
+              if (options.signal?.aborted) return abort()
+              // Clear before invoking: a throwing or cancelled tool may already
+              // have changed the world. Never retain its old pending frame.
+              retrySuspension = false
+              try {
+                value = await tool.execute(snapshot.args, snapshot.kwargs)
+                trace.ok = true
+              } catch (caught) {
+                const hostError = caught instanceof Error ? caught : new Error(String(caught))
+                const pythonType = hostError instanceof HostToolError ? hostError.pythonType : 'RuntimeError'
+                trace.error = pythonType + ': ' + hostError.message
+                error = new MontyRuntimeError(pythonType, hostError.message)
+              }
+            }
+            trace.durationMs = performance.now() - startedAt
+            calls.push(trace)
+            if (options.signal?.aborted) return abort()
+            progress = error ? await snapshot.resumeError(error) : await snapshot.resume(value)
+          }
+
+          let checkpoint: InterpreterCheckpoint | undefined
+          if (maxCheckpointBytes !== undefined) {
+            const bytes = await session.dump()
+            checkCheckpointSize(bytes, maxCheckpointBytes)
+            checkpoint = { kind: 'idle', bytes }
+          }
+          return {
+            result: {
+              status: 'ok', output: progress.output, stdout: stdout.text,
+              stdoutTruncated: stdout.truncated, calls,
+            },
+            checkpoint,
+            retrySuspension: false,
+          }
+        } catch (error) {
+          return pythonFailure(error)
+        }
+      })
+    } catch (error) {
+      return pythonFailure(error)
     }
-
-    return { status: 'ok', output: progress.output, stdout: stdout.text, stdoutTruncated: stdout.truncated, calls }
   }
 }

@@ -98,6 +98,20 @@ describe('host tools', () => {
     expect(result.calls).toHaveLength(3)
   })
 
+  it('keeps underscore-prefixed helpers callable and statically checked', async () => {
+    let dispatched = 0
+    const runner = new CodeRunner({ tools: [{
+      ...double, name: '_double', execute: ([value]) => { dispatched++; return Number(value) * 2 },
+    }] })
+    expect((await runner.run('_double(2)')).output).toBe(4)
+    for (const code of ['_double(2)\n_double("bad")', '_double(2)\nmissing_name']) {
+      const rejected = await runner.run(code)
+      expect(rejected.errorKind).toBe('typing')
+      expect(rejected.calls).toEqual([])
+      expect(dispatched).toBe(1)
+    }
+  })
+
   it('rejects invalid tool names and duplicates', () => {
     const runner = new CodeRunner({ tools: [double] })
     expect(() => runner.addTool({ ...double, name: 'not valid' })).toThrow(/identifier/)

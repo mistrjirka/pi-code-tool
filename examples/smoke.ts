@@ -1,81 +1,55 @@
-/**
- * Smoke test for @pydantic/monty — verifies the primitives our code tool depends on:
- * 1. async external functions (the tool bridge)
- * 2. print() capture (the observation channel)
- * 3. the raw pause/resume state machine (per-call interception)
- * 4. MontyRepl pure-Python state + dump/load (production Session uses replay)
- * 5. runtime errors with Python tracebacks (model-facing error feedback)
- * 6. resource limits
- */
+/** Smoke-test the native feed, suspension, checkpoint, output and limit APIs. */
+import assert from 'node:assert/strict'
 import {
-  Monty,
-  MontyRepl,
-  MontySnapshot,
-  MontyNameLookup,
-  MontyComplete,
-  MontyRuntimeError,
-  runMontyAsync,
-} from '@pydantic/monty'
+  FunctionSnapshot, Monty, MontyComplete, MontyRuntimeError, NameLookupSnapshot,
+} from '@pydantic/monty/node'
 
-// 1 + 2: async external functions and print capture
-// NOTE: external functions are called WITHOUT `await` — the host-side pause/resume
-// bridge makes them synchronous from Python's perspective (verified on 0.0.18;
-// resuming with a plain value makes `await` fail with "'int' object can't be awaited").
-const code1 = `
-results = []
-for city in cities:
-    temp = get_temp(city)
-    results.append(f"{city}: {temp}C")
-print(", ".join(results))
-max(int(r.split(": ")[1][:-1]) for r in results)
-`
-const m1 = new Monty(code1, { inputs: ['cities'] })
-const stdout: string[] = []
-const out1 = await runMontyAsync(m1, {
-  inputs: { cities: ['Berlin', 'Tokyo'] },
-  externalFunctions: {
-    get_temp: async (city: unknown) => (city === 'Tokyo' ? 28 : 17),
-  },
-  // must return undefined — the native layer raises TypeError on any other return value
-  printCallback: (_stream, text) => {
-    stdout.push(text)
-  },
-})
-console.log('1/2 external functions + print:', JSON.stringify({ out1, stdout }))
-
-// 3: raw pause/resume — intercept each call ourselves
-const m2 = new Monty('double(7) + double(3)')
-let progress = m2.start()
-const calls: string[] = []
-while (!(progress instanceof MontyComplete)) {
-  if (progress instanceof MontyNameLookup) {
-    // resolve the unknown name to a marker so the call pauses as a snapshot
-    progress = progress.resume({ value: () => {} })
-  } else if (progress instanceof MontySnapshot) {
-    calls.push(`${progress.functionName}(${JSON.stringify(progress.args)})`)
-    progress = progress.resume({ returnValue: Number(progress.args[0]) * 2 })
-  }
-}
-console.log('3   pause/resume:', JSON.stringify({ calls, output: progress.output }))
-
-// 4: REPL persistence + serialization round-trip for pure Python
-const repl = new MontyRepl()
-repl.feed('x = 41')
-const restored = MontyRepl.load(repl.dump())
-console.log('4   repl dump/load:', JSON.stringify(restored.feed('x + 1')))
-
-// 5: runtime error with traceback
+const pool = await Monty.create({ minProcesses: 0, maxProcesses: 1 })
+let session = await pool.checkout({ limits: { maxFeedDurationSecs: 1 } })
 try {
-  new Monty('def f():\n    return 1 / 0\nf()').run()
-} catch (e) {
-  if (e instanceof MontyRuntimeError) {
-    console.log('5   traceback:\n' + e.display('traceback'))
-  }
-}
+  const printed: string[] = []
+  const result = await session.feedRun(
+    'saved = await get_temp("Tokyo")\nprint(saved)\nsaved',
+    {
+      externalLookup: { get_temp: async (city: unknown) => city === 'Tokyo' ? 28 : 17 },
+      printCallback: (_stream, text) => { printed.push(text) },
+    },
+  )
+  assert.equal(result, 28)
+  assert.equal(printed.join(''), '28\n')
+  console.log('Passed async host calls and captured output')
 
-// 6: limits
-try {
-  new Monty('while True:\n    pass').run({ limits: { maxDurationSecs: 1 } })
-} catch (e) {
-  console.log('6   limit enforced:', (e as Error).constructor.name, (e as Error).message.slice(0, 80))
+  const state = await session.dump()
+  await session.close()
+  session = await pool.checkout()
+  await session.loadSession(state)
+  assert.equal(await session.feedRun('saved + 1'), 29)
+  console.log('Passed native heap checkpoint and restore')
+
+  let progress = await session.feedStart('double(7) + double(3)')
+  let calls = 0
+  while (!(progress instanceof MontyComplete)) {
+    if (progress instanceof NameLookupSnapshot) {
+      progress = await progress.resume(progress.variableName)
+    } else if (progress instanceof FunctionSnapshot) {
+      calls++
+      progress = await progress.resume(Number(progress.args[0]) * 2)
+    } else {
+      throw new Error('Unexpected future')
+    }
+  }
+  assert.equal(progress.output, 20)
+  assert.equal(calls, 2)
+  console.log('Passed manual host-call suspension and resume')
+
+  await assert.rejects(session.feedRun('def fail():\n    return 1 / 0\nfail()'), (error: unknown) => {
+    assert(error instanceof MontyRuntimeError)
+    assert.match(error.display('traceback'), /ZeroDivisionError/)
+    return true
+  })
+  await assert.rejects(session.feedRun('while True:\n    pass'), /time limit exceeded/)
+  console.log('Passed Python tracebacks and per-feed execution limits')
+} finally {
+  await session.close()
+  await pool.close()
 }

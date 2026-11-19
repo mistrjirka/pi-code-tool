@@ -1,4 +1,4 @@
-import type { MountDir } from '@pydantic/monty'
+import type { MountDir } from '@pydantic/monty/node'
 
 /** A parameter of a host tool, described in Python terms for prompt rendering. */
 export interface HostToolParam {
@@ -76,10 +76,11 @@ export interface ToolCallTrace {
 }
 
 export interface RunLimits {
-  /** Max VM execution time in seconds (host tool time not included). Default 5. */
+  /** Max VM execution time per snippet (host tool time not included). Default 5 seconds. */
   maxDurationSecs?: number
   /** Max heap memory in bytes. Default 64 MiB. */
   maxMemory?: number
+  /** Unsupported by Monty 1.x. Supplying this returns a clear configuration error. */
   maxAllocations?: number
   maxRecursionDepth?: number
 }
@@ -99,9 +100,8 @@ export interface RunOptions {
   /** Streaming observer for print() chunks, called as they happen (uncapped). */
   onPrint?: (text: string) => void
   /**
-   * Lines the caller prepended to the code (e.g. a session's replayed
-   * transcript), subtracted from reported typing-diagnostic line numbers so
-   * they point into the code the caller submitted.
+   * Lines the caller prepended to the code, subtracted from typing-diagnostic
+   * line numbers so they point into the original submitted source.
    */
   lineOffset?: number
   /**
@@ -109,15 +109,15 @@ export interface RunOptions {
    * mid-execution while this resolves; returning false raises a catchable
    * PermissionError in the sandbox, and returning 'suspend' stops the run
    * before the call executes so it can be resumed later (see Session.resume():
-   * the replay cache picks up where it left off). Gated calls are denied if
-   * omitted.
+   * the saved interpreter checkpoint continues exactly where it paused).
+   * Gated calls are denied if this callback is omitted.
    */
   onApproval?: (request: ApprovalRequest) => ApprovalDecision | Promise<ApprovalDecision>
 }
 
 export type ApprovalDecision = boolean | 'suspend'
 
-export type RunErrorKind = 'syntax' | 'runtime' | 'typing' | 'aborted'
+export type RunErrorKind = 'syntax' | 'runtime' | 'typing' | 'aborted' | 'state'
 
 interface RunResultBase {
   /** Captured print() output — the model-facing observation channel. */

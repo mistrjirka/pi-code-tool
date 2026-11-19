@@ -1,99 +1,62 @@
 import { CodeRunner } from './runner.js'
-import { ToolRegistry } from './registry.js'
-import { DEFAULT_MAX_STDOUT_BYTES, appendCappedUtf8 } from './stdout.js'
-import { HostToolError } from './types.js'
-import type { ApprovalRequest, HostTool, RunLimits, RunOptions, RunResult } from './types.js'
-
-interface Snippet {
-  code: string
-  inputs?: Record<string, unknown>
-}
-
-interface CachedCall {
-  tool: string
-  /** JSON identity of the call's args/kwargs; absent in pre-v2 states (matches any). */
-  key?: string
-  result?: unknown
-  /** Host-tool exception raised into Python; replay re-raises the same exception. */
-  error?: { pythonType: string; message: string }
-  /** The user denied this gated call; replay re-raises without re-prompting. */
-  denied?: true
-}
+import type { InterpreterCheckpoint } from './runner.js'
+import { DEFAULT_MAX_CHECKPOINT_BYTES, MONTY_VERSION, checkCheckpointSize } from './runtime.js'
+import type { CodeRunnerOptions } from './runner.js'
+import type { RunOptions, RunResult } from './types.js'
 
 interface SuspendedRun {
-  /** The snippet stopped at a gated call; resume() replays it up to the gate. */
   code: string
-  /** Cache length before the suspended run — the rollback point. */
-  cacheLen: number
-  /** Output the partial run already delivered, suppressed again on resume. */
-  stdout: string
-  /** Actual character count for partial output; stdout may be capped/truncated. */
-  stdoutChars?: number
-  /** Inputs the suspended run was started with, re-applied on resume. */
-  inputs?: Record<string, unknown>
+  checkpoint: string
 }
 
 interface SessionState {
-  version: number
-  snippets: Snippet[]
-  calls: CachedCall[]
-  stdout: string
-  /** Actual character count for committed stdout; stdout may be capped/truncated. */
-  stdoutChars?: number
-  suspended?: SuspendedRun
+  version: 3
+  montyVersion: string
+  length: number
+  contract: string | null
+  checkpoint: string | null
+  suspended: SuspendedRun | null
 }
 
-export interface SessionOptions {
-  tools?: HostTool[] | ToolRegistry
-  /** Default limits for every run (applied to the whole replayed script). */
-  limits?: RunLimits
-  /** Pre-execution static type checking (see CodeRunnerOptions). Default true. */
-  typeCheck?: boolean
+export interface SessionOptions extends CodeRunnerOptions {
+  /** Maximum bytes in each native checkpoint. Default 64 MiB. */
+  maxCheckpointBytes?: number
 }
 
-const normalize = (code: string) => code.replace(/\n+$/, '')
-
-const callKey = (args: unknown[], kwargs: Record<string, unknown>) =>
-  JSON.stringify([args, kwargs])
+const stateFailure = (error: string): RunResult => ({
+  status: 'error', output: undefined, stdout: '', stdoutTruncated: false,
+  calls: [], errorKind: 'state', error,
+})
 
 /**
- * A persistent Python session: variables and functions defined in one `run()`
- * are available in the next.
+ * Persistent Python heap and call stack, stored as native checkpoints.
+ * Only the newly submitted snippet executes. Earlier code, filesystem reads,
+ * host calls, approvals and printed output are never replayed.
  *
- * monty's `MontyRepl` cannot dispatch external functions or capture print
- * (verified on 0.0.18 — `feed()` takes only `mount`), so sessions replay
- * instead: each run executes the transcript of successful snippets plus the
- * new code in a fresh interpreter, serving prior host-tool calls from a
- * recorded cache so their side effects don't repeat. Failed snippets are
- * dropped entirely — they leave no namespace changes behind (though host
- * calls they made before failing did execute once).
- *
- * State serializes to plain JSON (`dump()`/`Session.load()`), so snippets,
- * cached results, and inputs must stay JSON-serializable.
+ * A failed snippet restores its previous Python heap. External changes remain.
+ * A suspended snippet also retains that idle heap for explicit abandonment.
  */
 export class Session {
-  private readonly registry: ToolRegistry
-  private readonly limits?: RunLimits
-  private readonly typeCheck?: boolean
-  private snippets: Snippet[] = []
-  private calls: CachedCall[] = []
-  private stdout = ''
-  private stdoutChars = 0
+  private readonly runner: CodeRunner
+  private readonly maxCheckpointBytes: number
+  private checkpoint: string | null = null
+  private contract: string | null = null
+  private completed = 0
   private suspended: SuspendedRun | null = null
+  private busy = false
 
   constructor(options: SessionOptions = {}) {
-    this.registry =
-      options.tools instanceof ToolRegistry ? options.tools : new ToolRegistry(options.tools)
-    this.limits = options.limits
-    this.typeCheck = options.typeCheck
+    this.runner = new CodeRunner(options)
+    this.maxCheckpointBytes = options.maxCheckpointBytes ?? DEFAULT_MAX_CHECKPOINT_BYTES
+    if (!Number.isSafeInteger(this.maxCheckpointBytes) || this.maxCheckpointBytes < 1) {
+      throw new Error('maxCheckpointBytes must be a positive safe integer')
+    }
   }
 
-  /** Number of successful snippets in the transcript. */
   get length(): number {
-    return this.snippets.length
+    return this.completed
   }
 
-  /** The gated snippet awaiting a decision; call resume() to continue it. */
   get suspendedCode(): string | null {
     return this.suspended?.code ?? null
   }
@@ -102,247 +65,143 @@ export class Session {
     if (this.suspended) {
       throw new Error('A run is suspended; call resume() or abandon() before running new code')
     }
-    return this.execute(code, options, null)
+    return this.execute(code, options, false)
   }
 
-  /** Resume the currently suspended snippet, preserving its original code and inputs. */
   async resume(options: RunOptions = {}): Promise<RunResult> {
     if (!this.suspended) throw new Error('No suspended run to resume')
-    return this.execute(this.suspended.code, options, this.suspended)
+    return this.execute(this.suspended.code, options, true)
   }
 
-  /** Discard a pending suspension and roll back its pre-gate cached calls. */
+  /** Discard only the paused frame. Completed host effects are not undone. */
   abandon(): boolean {
+    this.ensureIdle()
     if (!this.suspended) return false
-    this.calls = this.calls.slice(0, this.suspended.cacheLen)
     this.suspended = null
+    if (!this.checkpoint) this.contract = null
     return true
   }
 
-  private async execute(
-    code: string,
-    options: RunOptions,
-    prior: SuspendedRun | null,
-  ): Promise<RunResult> {
-    const resuming = prior !== null
-    const rollbackTo = resuming ? prior!.cacheLen : this.calls.length
-    if (resuming) this.suspended = null
-
-    const transcript = this.snippets.map((s) => normalize(s.code))
-    const combined = [...transcript, normalize(code)].join('\n')
-    const transcriptText = transcript.join('\n')
-    const transcriptLines = transcriptText === '' ? 0 : transcriptText.split('\n').length
-    const runInputs =
-      resuming && prior!.inputs ? { ...prior!.inputs, ...options.inputs } : options.inputs
-    const inputs = this.mergedInputs(runInputs)
-
-    // Replay wrapper: serve recorded host-tool calls from the cache so side
-    // effects never run twice. Entries are matched against the live call's
-    // identity (tool + arguments); a mismatch means the replay diverged —
-    // stop serving the stale tail and execute live from there.
-    const cacheEnd = this.calls.length
-    let serveBefore = cacheEnd
-    let cursor = 0
-    let served = 0
-    let divergedAt: number | null = null
-    const liveCalls = this.calls
-    const diverge = () => {
-      if (divergedAt === null) {
-        divergedAt = cursor
-        serveBefore = cursor
-      }
-    }
-    const matches = (entry: CachedCall, tool: string, key: string) =>
-      entry.tool === tool && (entry.key === undefined || entry.key === key)
-    const wrapped = new ToolRegistry(
-      this.registry.list().map((tool) => ({
-        ...tool,
-        execute: async (args: unknown[], kwargs: Record<string, unknown>) => {
-          const key = callKey(args, kwargs)
-          const entry = cursor < serveBefore ? liveCalls[cursor] : undefined
-          if (entry && !entry.denied && matches(entry, tool.name, key)) {
-            cursor++
-            served++
-            if (entry.error) {
-              throw new HostToolError(entry.error.message, entry.error.pythonType)
-            }
-            return entry.result
-          }
-          if (entry) diverge()
-          try {
-            const result = await tool.execute(args, kwargs)
-            liveCalls.push({ tool: tool.name, key, result })
-            return result
-          } catch (e) {
-            const err = e instanceof Error ? e : new Error(String(e))
-            const pythonType = err instanceof HostToolError ? err.pythonType : 'RuntimeError'
-            liveCalls.push({ tool: tool.name, key, error: { pythonType, message: err.message } })
-            throw e
-          }
-        },
-      })),
-    )
-
-    // Replay re-prints earlier output (committed transcript plus a suspended
-    // run's already-delivered partial output); forward and capture only chunks
-    // past it. Track actual character counts separately from capped captured
-    // stdout so truncation doesn't make replayed tail look new later.
-    const priorStdoutChars = resuming ? (prior!.stdoutChars ?? prior!.stdout.length) : 0
-    const replayChars = this.stdoutChars + priorStdoutChars
-    const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES
-    let printed = 0
-    let stdout = { text: '', bytes: 0, truncated: false }
-    const onPrint = (text: string) => {
-      const start = printed
-      printed += text.length
-      if (printed <= replayChars) return
-      const fresh = text.slice(Math.max(0, replayChars - start))
-      stdout = appendCappedUtf8(stdout, fresh, maxStdoutBytes)
-      options.onPrint?.(fresh)
-    }
-
-    // Replayed gated calls were already decided: executed ones are served
-    // from the cache (no side effect can happen) and denied ones re-raise
-    // PermissionError, so the user is never re-asked for a decision they
-    // already made. Live denials are recorded so replay stays aligned.
-    const onApproval = options.onApproval
-      ? async (request: ApprovalRequest): Promise<boolean | 'suspend'> => {
-          const key = callKey(request.args, request.kwargs)
-          const entry = cursor < serveBefore ? liveCalls[cursor] : undefined
-          if (entry && matches(entry, request.tool, key)) {
-            if (!entry.denied) return true // execute() serves the cached result
-            cursor++
-            served++
-            return false
-          }
-          if (entry) diverge()
-          const decision = await options.onApproval!(request)
-          if (decision === false) liveCalls.push({ tool: request.tool, key, denied: true })
-          return decision
-        }
-      : undefined
-
-    const runner = new CodeRunner({ tools: wrapped, limits: this.limits, typeCheck: this.typeCheck })
-    const result = await runner.run(combined, {
-      ...options,
-      onPrint,
-      onApproval,
-      inputs: Object.keys(inputs).length > 0 ? inputs : undefined,
-      lineOffset: transcriptLines + (options.lineOffset ?? 0),
-    })
-
-    // Surface only this snippet's new contribution: not the replayed prefix,
-    // and not output a suspension already delivered. This is captured from the
-    // uncapped print stream rather than runner.stdout, because runner.stdout is
-    // capped across the whole replayed script and prior output can consume it.
-    result.stdout = stdout.text
-    result.stdoutTruncated = stdout.truncated
-    result.calls = result.calls.slice(served)
-
-    // Entries from a divergence point up to the old cache end were proven
-    // stale (the live run re-made those calls); drop them so the fresh
-    // results pushed after them take their positions.
-    const reconcile = () => {
-      if (divergedAt !== null) {
-        this.calls = [...this.calls.slice(0, divergedAt), ...this.calls.slice(cacheEnd)]
-      }
-    }
-    // Everything the partial run has delivered so far, for suppression on
-    // resume. A failed resume can end short of the prior partial output —
-    // keep the longer record so nothing re-emits.
-    const partialStdout = () => {
-      const freshChars = Math.max(0, printed - replayChars)
-      return {
-        stdout: (resuming ? prior!.stdout : '') + stdout.text,
-        stdoutChars: priorStdoutChars + freshChars,
-      }
-    }
-
-    if (result.status === 'ok') {
-      reconcile()
-      this.snippets.push({ code, ...(runInputs ? { inputs: runInputs } : {}) })
-      this.stdout += (resuming ? prior!.stdout : '') + result.stdout
-      this.stdoutChars = printed
-    } else if (result.status === 'suspended') {
-      // keep this run's executed calls cached so resuming doesn't repeat
-      // them, plus the delivered output and the inputs it ran with
-      reconcile()
-      const partial = partialStdout()
-      this.suspended = {
-        code,
-        cacheLen: divergedAt === null ? rollbackTo : Math.min(rollbackTo, divergedAt),
-        stdout: partial.stdout,
-        stdoutChars: partial.stdoutChars,
-        ...(runInputs ? { inputs: runInputs } : {}),
-      }
-    } else if (resuming && divergedAt === null) {
-      // The resume failed past the gate (denial, tool error, abort). The
-      // calls that DID execute are real side effects — keep them cached and
-      // restore the suspension so retrying replays instead of re-executing.
-      // Trailing denials are dropped so a retry asks for the decision again.
-      while (this.calls.length > rollbackTo && this.calls[this.calls.length - 1]!.denied) {
-        this.calls.pop()
-      }
-      const partial = partialStdout()
-      this.suspended = {
-        code,
-        cacheLen: rollbackTo,
-        stdout: partial.stdout,
-        stdoutChars: partial.stdoutChars,
-        ...(runInputs ? { inputs: runInputs } : {}),
-      }
-    } else {
-      this.calls = this.calls.slice(0, rollbackTo)
-    }
-    return result
+  reset(): void {
+    this.ensureIdle()
+    this.checkpoint = null
+    this.contract = null
+    this.suspended = null
+    this.completed = 0
   }
 
-  reset(): void {
-    this.snippets = []
-    this.calls = []
-    this.stdout = ''
-    this.stdoutChars = 0
-    this.suspended = null
+  private ensureIdle(): void {
+    if (this.busy) throw new Error('This Python session is already executing')
+  }
+
+  private async execute(code: string, options: RunOptions, resuming: boolean): Promise<RunResult> {
+    this.ensureIdle()
+    if (Buffer.byteLength(code) > this.maxCheckpointBytes) {
+      return stateFailure('Submitted Python code exceeds the checkpoint size limit. Previous state was preserved.')
+    }
+    const contract = this.runner.contract(options)
+    if (this.contract !== null && contract !== this.contract) {
+      return stateFailure(
+        'cannot safely restore this Python session after helper types, execution limits, ' +
+        'or type-check settings changed. Saved state was preserved and no code ran. ' +
+        'Use reset=true to start a session with the current settings.',
+      )
+    }
+    const previous = this.suspended
+    const serialized = resuming ? previous!.checkpoint : this.checkpoint
+    const initial: InterpreterCheckpoint | undefined = serialized ? {
+      kind: resuming ? 'suspended' : 'idle',
+      bytes: Buffer.from(serialized, 'base64'),
+    } : undefined
+
+    this.busy = true
+    try {
+      const outcome = await this.runner.runCheckpoint(code, options, initial, this.maxCheckpointBytes)
+      const result = outcome.result
+      if (result.status === 'ok') {
+        if (outcome.checkpoint?.kind !== 'idle') throw new Error('Missing completed interpreter checkpoint')
+        this.checkpoint = outcome.checkpoint.bytes.toString('base64')
+        this.contract = contract
+        this.suspended = null
+        this.completed++
+      } else if (result.status === 'suspended') {
+        if (outcome.checkpoint?.kind !== 'suspended') throw new Error('Missing suspended interpreter checkpoint')
+        this.suspended = { code, checkpoint: outcome.checkpoint.bytes.toString('base64') }
+        this.contract = contract
+      } else if (resuming && !outcome.retrySuspension) {
+        // Reusing the old pending frame here could repeat a tool that already
+        // executed, including when serialization or a size limit fails afterward.
+        this.suspended = null
+        if (!this.checkpoint) this.contract = null
+        result.error += '\nThe suspended snippet stopped. Previous Python state was restored; ' +
+          'completed host calls were not undone. There is no pending frame to retry.'
+      }
+      return result
+    } finally {
+      this.busy = false
+    }
   }
 
   dump(): string {
     const state: SessionState = {
-      version: 2,
-      snippets: this.snippets,
-      calls: this.calls,
-      stdout: this.stdout,
-      stdoutChars: this.stdoutChars,
-      ...(this.suspended ? { suspended: this.suspended } : {}),
+      version: 3,
+      montyVersion: MONTY_VERSION,
+      length: this.completed,
+      contract: this.contract,
+      checkpoint: this.checkpoint,
+      suspended: this.suspended,
     }
     return JSON.stringify(state)
   }
 
-  static load(json: string, options: SessionOptions = {}): Session {
-    const state = JSON.parse(json) as SessionState
-    if (state.version !== 1 && state.version !== 2) {
-      throw new Error(`Unsupported session version: ${state.version}`)
+  static load(serialized: string, options: SessionOptions = {}): Session {
+    let state: SessionState
+    try {
+      state = JSON.parse(serialized) as SessionState
+    } catch {
+      throw new Error('cannot safely restore invalid Python state. Saved state must be preserved; use reset=true.')
+    }
+    if (!state || state.version !== 3) {
+      throw new Error(
+        'cannot safely restore legacy Python replay state: its original filesystem reads were not saved. ' +
+        'Saved state must be preserved; use reset=true to start a new session.',
+      )
+    }
+    if (state.montyVersion !== MONTY_VERSION) {
+      throw new Error(
+        'cannot safely restore a Python checkpoint from a different interpreter version. ' +
+        'Saved state must be preserved; use reset=true to start a new session.',
+      )
     }
     const session = new Session(options)
-    session.snippets = state.snippets
-    session.calls = state.calls
-    session.stdout = state.stdout
-    session.stdoutChars = state.stdoutChars ?? state.stdout.length
-    // pre-v2 suspensions lack the delivered-stdout record; resuming one
-    // re-emits the partial output once rather than failing the restore
+    const validContract = state.contract === null ||
+      (typeof state.contract === 'string' && /^[a-f0-9]{64}$/.test(state.contract))
+    if (!Number.isSafeInteger(state.length) || state.length < 0 || !validContract ||
+        (state.checkpoint !== null && typeof state.checkpoint !== 'string') ||
+        (state.suspended !== null && (!state.suspended || typeof state.suspended.code !== 'string' ||
+          typeof state.suspended.checkpoint !== 'string')) ||
+        ((state.checkpoint !== null || state.suspended !== null) && state.contract === null)) {
+      throw new Error('cannot safely restore malformed Python state. Saved state must be preserved; use reset=true.')
+    }
+    for (const checkpoint of [state.checkpoint, state.suspended?.checkpoint]) {
+      if (checkpoint === null || checkpoint === undefined) continue
+      if (checkpoint.length === 0 || checkpoint.length % 4 !== 0 ||
+          !/^[A-Za-z0-9+/]*={0,2}$/.test(checkpoint)) {
+        throw new Error('cannot safely restore malformed Python checkpoint bytes. Use reset=true.')
+      }
+      if (checkpoint.length > Math.ceil(session.maxCheckpointBytes / 3) * 4) {
+        throw new Error('cannot safely restore a Python checkpoint above the size limit. Use reset=true.')
+      }
+      const bytes = Buffer.from(checkpoint, 'base64')
+      checkCheckpointSize(bytes, session.maxCheckpointBytes)
+      if (bytes.toString('base64') !== checkpoint) {
+        throw new Error('cannot safely restore malformed Python checkpoint bytes. Use reset=true.')
+      }
+    }
+    session.checkpoint = state.checkpoint
+    session.contract = state.contract
+    session.completed = state.length
     session.suspended = state.suspended
-      ? {
-          ...state.suspended,
-          stdout: state.suspended.stdout ?? '',
-          stdoutChars: state.suspended.stdoutChars ?? (state.suspended.stdout ?? '').length,
-        }
-      : null
     return session
-  }
-
-  private mergedInputs(current?: Record<string, unknown>): Record<string, unknown> {
-    const merged: Record<string, unknown> = {}
-    for (const snippet of this.snippets) Object.assign(merged, snippet.inputs)
-    Object.assign(merged, current)
-    return merged
   }
 }

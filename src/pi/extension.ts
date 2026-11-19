@@ -18,7 +18,7 @@ import { Type } from 'typebox'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
-import { MountDir } from '@pydantic/monty'
+import { MountDir } from '@pydantic/monty/node'
 import { probeImportableModules } from '../core/capabilities.js'
 import { renderPythonToolRules, ToolRegistry } from '../core/registry.js'
 import { createBuiltinTools } from '../core/builtins.js'
@@ -80,7 +80,7 @@ export interface PythonExtensionOptions {
    * Default: <root>/.pi/code-tools.
    */
   toolStore?: string | false
-  /** Interpreter limits per run (applied to the replayed transcript). */
+  /** Interpreter limits per submitted snippet. A saved session keeps its configured limits. */
   limits?: RunLimits
 }
 
@@ -122,13 +122,13 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
   return async (pi: ExtensionAPI) => {
     const toolName = options.toolName ?? DEFAULT_TOOL_NAME
     const root = options.root ?? process.cwd()
-    // One MountDir per run: monty rejects a mount shared with another live
-    // run, and suspended runs stay live (they hold their mount) until GC'd.
+    const importableModules = await probeImportableModules()
+    // Bind only the current workspace for each operation, including restored frames.
     let makeMount: (() => MountDir) | undefined
     if (options.mountWorkspace ?? true) {
       try {
         if (!statSync(root).isDirectory()) throw new Error('not a directory')
-        makeMount = () => new MountDir('/workspace', root, { mode: 'read-only' })
+        makeMount = () => new MountDir({ virtualPath: '/workspace', hostPath: root, mode: 'read-only' })
       } catch {
         // root missing/unreadable: degrade to the read_file tool rather than
         // failing the whole extension load
@@ -174,8 +174,8 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     // which is async, so creation happens lazily in execute().
     let session: Session | null = null
     let preludeNote = ''
-    // set when state came from a previous conversation and hasn't run yet
-    let restoredUnverified = false
+    // Keep incompatible state byte-for-byte until an explicit reset.
+    let blockedState: { state: string; error: string } | null = null
 
     async function freshSession(
       opts: { quiet?: boolean; mount?: MountDir } = {},
@@ -226,15 +226,18 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           break
         }
       }
+      blockedState = null
       try {
         session = state ? Session.load(decodeSessionState(state), sessionOptions) : null
-      } catch {
-        // unreadable state (e.g. written by an incompatible version): start
-        // fresh rather than failing every session start
+      } catch (error) {
         session = null
-        state = undefined
+        if (state) {
+          blockedState = {
+            state,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
       }
-      restoredUnverified = Boolean(state)
     })
 
     function describe(visibleRegistry: ToolRegistry = registry, sessionBacked = false): string {
@@ -263,7 +266,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           : []),
         '',
         'Rules:',
-        renderPythonToolRules(probeImportableModules()),
+        renderPythonToolRules(importableModules),
         ...(gatedNames.length > 0
           ? [
               `- Calls to ${gatedNames.join('/')} pause the script for per-call user approval; a denial raises PermissionError (catch it or stop gracefully), and the user may suspend the script instead — resume later with {"resume": true}, or discard it with {"abandon": true}. Group related work so the user approves meaningful units.`,
@@ -321,9 +324,16 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const inBridgeContext = <T>(run: () => Promise<T>) =>
           bridgeExecution.run(piBridgeContext(ctx, signal), run)
-        if (params.reset || !session) {
+        if (params.reset) {
           session = await inBridgeContext(() => freshSession())
-          restoredUnverified = false
+          blockedState = null
+        } else if (blockedState) {
+          return {
+            content: [{ type: 'text', text: blockedState.error + '\nNo code ran. Use reset=true to discard the saved state explicitly.' }],
+            details: { status: 'error', state: blockedState.state, calls: [] } satisfies PythonDetails,
+          }
+        } else if (!session) {
+          session = await inBridgeContext(() => freshSession())
         }
 
         // gated calls freeze the script while the human decides in the TUI;
@@ -379,14 +389,13 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
 
         let result: RunResult
         if (params.resume) {
-          try {
-            result = await inBridgeContext(() => session!.resume(runOptions))
-          } catch {
+          if (!session.suspendedCode) {
             return {
-              content: [{ type: 'text', text: '(nothing is suspended — run code normally)' }],
+              content: [{ type: 'text', text: '(nothing is suspended; run code normally)' }],
               details: { status: 'error', state: encodeSessionState(session.dump()), calls: [] } satisfies PythonDetails,
             }
           }
+          result = await inBridgeContext(() => session!.resume(runOptions))
         } else {
           if (session.suspendedCode) {
             return {
@@ -429,12 +438,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         } else {
           if (text && !text.endsWith('\n')) text += '\n'
           text += result.error
-          if (restoredUnverified) {
-            text +=
-              '\n[note: session state was restored from an earlier conversation; if this error references older code, retry with reset=true]'
-          }
         }
-        restoredUnverified = false
 
         const truncation = truncateHead(text, {
           maxLines: DEFAULT_MAX_LINES,

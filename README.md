@@ -138,16 +138,46 @@ if (result.status === 'ok') console.log(result.output)
 
 `RunResult` is a discriminated union with `status: 'ok' | 'error' | 'suspended'`,
 `stdout`, `stdoutTruncated`, and per-call traces. `Session` adds persistent state
-across runs (replay with a tool-call cache — earlier side effects never repeat) and
-serializes to JSON with `dump()` / `Session.load()`. If an approval gate suspends a
-run, call `session.resume()` to continue or `session.abandon()` to discard it before
-running new code. `ToolStore` adds the saved-tools layer.
+across runs by saving the interpreter heap and paused call stack. Later calls run
+only the new snippet. Earlier filesystem reads, tool calls, approvals and printed
+output do not run again. New reads still see the current mounted files.
+
+State serializes to JSON with native checkpoint bytes through
+`dump()` / `Session.load()`. If an approval gate suspends a run, call
+`session.resume()` to continue at that call, or `session.abandon()`
+to discard its frame. Each operation closes its interpreter workers.
+
+A failed snippet restores the previous Python heap. Host changes already made
+are not undone. If an accepted resume fails after doing work, its pending frame
+is discarded so another resume cannot repeat completed calls. A denial that
+stops before further work can be retried at the same gate.
+
+### Saved-state compatibility
+
+This fork pins `@pydantic/monty@1.0.0` and requires Node 20 or newer.
+
+- Version-3 state uses native checkpoints. Each checkpoint is limited to 64 MiB
+  by default. Native source/type metadata can grow across feeds. The source
+  of a pending snippet has the same bound. Exceeding a
+  limit returns an error and preserves the last committed heap.
+- Legacy version-1/version-2 state cannot recover its original direct file reads.
+  It stays unchanged and blocks execution until the caller explicitly supplies
+  `reset=true`. It is never silently replayed or reset.
+- Changing the interpreter version, helper parameter/return types, type-check
+  setting, script name, or configured execution limits requires an explicit
+  reset. Tool descriptions and registration order do not force a reset.
+- Execution time resets for each new snippet and excludes host-tool waits.
+  Resuming a paused snippet retains its remaining execution budget.
+- `maxAllocations` is no longer supported. Use `maxMemory` instead.
+- A resumed frame keeps its original inputs. New inputs belong to a new snippet.
+- `probeImportableModules()`, `probeTypeCheckerGaps()` and
+  `ToolRegistry.renderTypeStubs()` are now asynchronous.
 
 ## Develop
 
 ```bash
 npm install
-npm test            # vitest (111 tests)
+npm test            # vitest
 npm run typecheck
 npm run smoke       # verifies monty primitives on your machine
 npx tsx examples/demo.ts
@@ -156,15 +186,16 @@ npx tsx examples/demo.ts
 ## Architecture
 
 ```
-src/core/    runner.ts    CodeRunner: owns monty's start/resume loop; tool dispatch,
+src/core/    runner.ts    CodeRunner: owns native feed/resume dispatch; tool dispatch,
                           tracebacks, limits, abort, per-call traces
              registry.ts  ToolRegistry + Python/typecheck stub rendering + prompt rules
              builtins.ts  read_file / list_files / http_get starter tools
-             session.ts   Persistent state via transcript replay + tool-call cache
+             session.ts   Persistent native heap and approval checkpoints
+             runtime.ts   Worker lifetime, version pin, and bounded checkpoints
              toolstore.ts Agent-saved tools as plain .py files + manage-from-sandbox
 src/pi/      extension.ts pi adapter: `code` tool (configurable name), streaming output, branch-safe state
              bridge.ts    pi built-in tools → Python stubs; bash/edit/write approval-gated
 ```
 
-Known monty 0.0.18 quirks we code around are documented in
+Historical Monty 0.0.18 findings are retained in
 [docs/research/03-monty.md](docs/research/03-monty.md).

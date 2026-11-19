@@ -1,80 +1,75 @@
-import { Monty } from '@pydantic/monty'
+import { Monty, MontyRuntimeError, MontyTypingError } from '@pydantic/monty/node'
+import { checkCode, normalizeLimits } from './runtime.js'
 
-/**
- * Stdlib modules worth probing — common agent-code imports. Monty supports a
- * small (growing) subset; everything else raises ModuleNotFoundError.
- */
+/** Common agent-code imports, probed against the actual installed interpreter. */
 const CANDIDATE_MODULES = [
-  'json',
-  're',
-  'datetime',
-  'math',
-  'os',
-  'sys',
-  'typing',
-  'asyncio',
-  'pathlib',
-  'time',
-  'random',
-  'collections',
-  'itertools',
-  'functools',
-  'string',
-  'textwrap',
-  'base64',
-  'hashlib',
-  'statistics',
-  'io',
-  'copy',
-  'enum',
-  'dataclasses',
-  'uuid',
-  'csv',
-  'urllib',
+  'json', 're', 'datetime', 'math', 'os', 'sys', 'typing', 'asyncio', 'pathlib',
+  'time', 'random', 'collections', 'itertools', 'functools', 'string', 'textwrap',
+  'base64', 'hashlib', 'statistics', 'io', 'copy', 'enum', 'dataclasses', 'uuid',
+  'csv', 'urllib',
 ]
+let defaultModules: Promise<string[]> | undefined
 
-/**
- * Empirically determines which modules the installed monty can import, by
- * trying each in a throwaway interpreter (microseconds apiece). Probing the
- * runtime keeps the prompt truthful across monty upgrades.
- */
-export function probeImportableModules(candidates: string[] = CANDIDATE_MODULES): string[] {
-  return candidates.filter((name) => {
-    try {
-      new Monty(`import ${name}`).run()
-      return true
-    } catch {
-      return false
-    }
-  })
+export async function probeImportableModules(
+  candidates: string[] = CANDIDATE_MODULES,
+): Promise<string[]> {
+  if (candidates === CANDIDATE_MODULES) {
+    defaultModules ??= probeModules(candidates)
+    return [...await defaultModules]
+  }
+  return probeModules(candidates)
 }
 
-/**
- * Runtime names monty's bundled type checker historically didn't know
- * (verified gaps on 0.0.18). Each is probed before being declared, so the
- * workaround self-prunes once ty learns a name.
- */
-const TY_GAP_CANDIDATES = [
-  'open',
-  'bytearray',
-  'PermissionError',
-  'FileNotFoundError',
-  'IsADirectoryError',
-  'NotADirectoryError',
-]
-
-/**
- * Names the interpreter provides at runtime that its type checker rejects as
- * unresolved. These need `name: Any = None` declarations in any typecheck
- * prefix so valid code isn't refused pre-execution.
- */
-export function probeTypeCheckerGaps(candidates: string[] = TY_GAP_CANDIDATES): string[] {
-  return candidates.filter((name) => {
-    try {
-      new Monty(name, { typeCheck: true })
-      return false // ty resolves it; declaring it would shadow real checking
-    } catch {
-      return true
+async function probeModules(candidates: string[]): Promise<string[]> {
+  const pool = await Monty.create({ minProcesses: 0, maxProcesses: 1, requestTimeout: 5 })
+  const importable: string[] = []
+  try {
+    for (const name of candidates) {
+      if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$/i.test(name)) continue
+      const session = await pool.checkout({ limits: normalizeLimits({ maxDurationSecs: 1 }) })
+      try {
+        await session.feedRun('import ' + name, { printCallback: () => {} })
+        importable.push(name)
+      } catch (error) {
+        if (!(error instanceof MontyRuntimeError) || error.exception.typeName !== 'ModuleNotFoundError') throw error
+        // A missing module is a capability result, not an extension-load error.
+      } finally {
+        await session.close()
+      }
     }
-  })
+    return importable
+  } finally {
+    await pool.close()
+  }
+}
+
+/** Known historical gaps. A fixed interpreter needs no declaration workaround. */
+const TY_GAP_CANDIDATES = [
+  'open', 'bytearray', 'PermissionError', 'FileNotFoundError',
+  'IsADirectoryError', 'NotADirectoryError',
+]
+let defaultGaps: Promise<string[]> | undefined
+
+export async function probeTypeCheckerGaps(
+  candidates: string[] = TY_GAP_CANDIDATES,
+): Promise<string[]> {
+  if (candidates === TY_GAP_CANDIDATES) {
+    defaultGaps ??= probeGaps(candidates)
+    return [...await defaultGaps]
+  }
+  return probeGaps(candidates)
+}
+
+async function probeGaps(candidates: string[]): Promise<string[]> {
+  const gaps: string[] = []
+  for (const name of candidates) {
+    if (!/^[a-z_][a-z0-9_]*$/i.test(name)) continue
+    try {
+      await checkCode(name, { typeCheck: true })
+    } catch (error) {
+      if (!(error instanceof MontyTypingError)) throw error
+      gaps.push(name)
+    }
+  }
+  return gaps
 }
