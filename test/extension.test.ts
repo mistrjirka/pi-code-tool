@@ -1,7 +1,7 @@
 import { gzipSync } from 'node:zlib'
 import { decodeSessionState } from '../src/pi/state-codec.js'
 import { describe, expect, it } from 'vitest'
-import { APPROVAL_CHOICES, createPythonExtension } from '../src/pi/extension.js'
+import managedExtension, { APPROVAL_CHOICES, createPythonExtension } from '../src/pi/extension.js'
 import type { HostTool } from '../src/index.js'
 
 type AnyTool = {
@@ -80,6 +80,19 @@ describe('python pi extension', () => {
     const { tool } = await loadExtension({ root: '/tmp', bridgePiTools: false })
     expect(tool.description).toContain('def list_files(')
     expect(tool.description).not.toContain('def bash(')
+  })
+
+  it('runs bash through the managed default without requiring an RPC approval UI', async () => {
+    const tools: AnyTool[] = []
+    await managedExtension({ registerTool: (tool: AnyTool) => tools.push(tool), on() {} } as never)
+    const [tool] = tools
+    expect(tool.description).not.toContain('pause the script for per-call user approval')
+    const result = await tool.execute('managed', { code: 'print(bash("printf noninteractive-ok"))' }, undefined, undefined, {
+      hasUI: true,
+      ui: { select: async () => { throw new Error('Unexpected approval dialog') } },
+    })
+    expect(result.details.status).toBe('ok')
+    expect(result.content[0].text).toContain('noninteractive-ok')
   })
 
   it('asks via ctx.ui.select for gated calls and honors the answer', async () => {

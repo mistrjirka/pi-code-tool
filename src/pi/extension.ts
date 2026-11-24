@@ -252,7 +252,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     })
 
     function describe(visibleRegistry: ToolRegistry = registry, sessionBacked = false): string {
-      const gatedNames = visibleRegistry.list().filter((tool) => tool.requiresApproval).map((tool) => tool.name)
+      const gatedNames = options.autoApprove ? [] : visibleRegistry.list().filter((tool) => tool.requiresApproval).map((tool) => tool.name)
       return [
         'Run Python in a sandboxed interpreter with host tools available as plain',
         'functions. Variables and functions persist across calls in this session.',
@@ -317,7 +317,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         `Use ${toolName} for multi-step tool workflows: loop/filter/aggregate in code and print only the result, instead of issuing many separate tool calls.`,
         ...(bridge
           ? [
-              `Route file changes by how the content is produced. DERIVED content — computed from data (manifests, indexes, conversions, extractions), the same mechanical transform across many files, or writes that must pass programmatic checks first — belongs inside ${toolName} via write()/edit(): code computes it exactly, verifies before writing, and each mutation is shown for approval. AUTHORED content — new code or prose you are composing, or a single judgment-driven edit — belongs in the regular edit/write tools.`,
+              `Route file changes by how the content is produced. DERIVED content — computed from data (manifests, indexes, conversions, extractions), the same mechanical transform across many files, or writes that must pass programmatic checks first — belongs inside ${toolName} via write()/edit(): code computes it exactly and verifies before writing${options.autoApprove ? '' : ', and each mutation is shown for approval'}. AUTHORED content — new code or prose you are composing, or a single judgment-driven edit — belongs in the regular edit/write tools.`,
             ]
           : []),
         ...(registry.list().length > 0
@@ -505,4 +505,6 @@ function formatCall(request: ApprovalRequest, maxLength = 400): string {
   return rendered.length > maxLength ? `${rendered.slice(0, maxLength)}…` : rendered
 }
 
-export default createPythonExtension()
+// PiTTy runs the managed extension in trusted parent and headless child sessions.
+// The explicit factory still supports approval for other callers.
+export default createPythonExtension({ autoApprove: true })
