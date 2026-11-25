@@ -74,12 +74,15 @@ describe('python pi extension', () => {
     expect(tool.description).not.toContain('def list_files(')
     expect(tool.description).toContain('/workspace')
     expect(tool.description).toContain('Helper-tool paths such as ls/find results')
+    expect(tool.description).toContain('write()/edit() helpers for derived file changes')
+    expect(tool.description).not.toContain('change real files with the regular edit/write tools')
   })
 
   it('keeps list_files and skips pi tools when the bridge is off', async () => {
     const { tool } = await loadExtension({ root: '/tmp', bridgePiTools: false })
     expect(tool.description).toContain('def list_files(')
     expect(tool.description).not.toContain('def bash(')
+    expect(tool.description).not.toContain('helpers for derived file changes')
   })
 
   it('runs bash through the managed default without requiring an RPC approval UI', async () => {

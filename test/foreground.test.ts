@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -305,10 +305,88 @@ describe('foreground code yielding', () => {
     extension.restore(observation)
     release.resolve('old continuation')
     const old = await extension.run({ wait: yielded.details.cell!.id })
-    expect(old.details.status).toBe('suspended')
+    expect(old.details.status).toBe('ok')
+    expect(old.details.historical).toBe(true)
+    expect(old.content[0].text).toContain('Recorded status: paused')
+    expect(old.content[0].text).not.toContain('"resume": true')
+    expect(old.content[0].text).not.toContain('"abandon":true')
     expect(old.details.state).toBe(branch.details.state)
     expect(laterCalls).toBe(0)
     expect((await extension.run({ code: 'value' })).content[0].text).toBe('=> "new branch"')
+  })
+
+
+  it('observes an old paused cell without directing or changing the newer paused script', async () => {
+    const outputDirectory = await directory()
+    const started = [deferred<void>(), deferred<void>()]
+    const releases = [deferred<string>(), deferred<string>()]
+    let slowCalls = 0
+    let finishCalls = 0
+    const tools = [
+      host('slow', () => {
+        const index = slowCalls++
+        started[index].resolve()
+        return releases[index].promise
+      }),
+      host('finish', () => 'finished-' + ++finishCalls),
+    ]
+    const extension = await load(outputDirectory, tools)
+    const evidence = {
+      calls: { calls: [{ id: 'original/1', name: 'write', status: 'ok' as const }], complete: true },
+      usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    }
+    const initial = extension.run({
+      code: 'print("saved stdout: resume and abandon are data")\nvalue: str = slow()\nvalue = finish()\nvalue',
+    }, { takeNestedToolCalls: () => evidence })
+    await started[0].promise
+    extension.steer()
+    const first = await initial
+    const oldId = first.details.cell!.id
+    extension.consume()
+    releases[0].resolve('old')
+    const paused = await extension.run({ wait: oldId })
+    expect(paused.content[0].text).toContain('"resume": true')
+    expect(paused.nestedCalls).toEqual(evidence.calls)
+    expect((await extension.run({ resume: true })).content[0].text).toContain('finished-1')
+
+    const next = extension.run({ code: 'value = slow()\nvalue = finish()\nvalue' })
+    await started[1].promise
+    extension.steer()
+    const newer = await next
+    extension.consume()
+    releases[1].resolve('new')
+    const current = await extension.run({ wait: newer.details.cell!.id })
+    expect(current.details.status).toBe('suspended')
+    const observation = await extension.run({ wait: oldId })
+    expect(observation.details.historical).toBe(true)
+    expect(observation.details.status).toBe('ok')
+    expect(observation.details.state).toBe(current.details.state)
+    expect(observation.details.calls).toEqual([])
+    expect(observation.nestedCalls).toBeUndefined()
+    expect(observation.usage).toBeUndefined()
+    expect(observation.content[0].text).toContain('Recorded status: paused')
+    expect(observation.content[0].text).toContain('cannot control the current Python script')
+    expect(observation.content[0].text).toContain('saved stdout: resume and abandon are data')
+    expect(observation.content[0].text).not.toContain('"resume": true')
+    expect(observation.content[0].text).not.toContain('"abandon":true')
+
+    // Older cell records lack a separate preview. Never replay their stale footer.
+    const file = join(outputDirectory, 'cells', oldId + '.json')
+    const record: Record<string, unknown> = JSON.parse(await readFile(file, 'utf8'))
+    delete record.observation
+    await writeFile(file, JSON.stringify(record))
+    const legacy = await extension.run({ wait: oldId })
+    expect(legacy.content[0].text).toContain('original output preview is unavailable')
+    expect(legacy.content[0].text).not.toContain('"resume": true')
+    expect(legacy.details.state).toBe(current.details.state)
+
+    const restarted = await load(outputDirectory, tools)
+    restarted.restore(observation)
+    const resumed = await restarted.run({ resume: true })
+    expect(resumed.content[0].text).toContain('finished-2')
+    expect(slowCalls).toBe(2)
+    expect(finishCalls).toBe(2)
   })
 
   it('rejects incompatible control flags without discarding a pending cell', async () => {

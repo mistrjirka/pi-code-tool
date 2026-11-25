@@ -261,6 +261,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
 
     function describe(visibleRegistry: ToolRegistry = registry, sessionBacked = false): string {
       const gatedNames = options.autoApprove ? [] : visibleRegistry.list().filter((tool) => tool.requiresApproval).map((tool) => tool.name)
+      const writeHelpers = ['write', 'edit'].filter((name) => visibleRegistry.has(name))
       return [
         'Run Python in a sandboxed interpreter with host tools available as plain',
         'functions. Variables and functions persist across calls in this session.',
@@ -296,7 +297,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           : []),
         ...(makeMount
           ? [
-              `- The workspace is mounted READ-ONLY at /workspace: read files with open("/workspace/<path>") or pathlib. Helper-tool paths such as ls/find results are relative to the workspace root. Files are not iterable — use .read()/.readlines(); parse JSON with json.loads(text). Writes raise PermissionError; change real files with the regular edit/write tools.`,
+              `- The workspace is mounted READ-ONLY at /workspace: read files with open("/workspace/<path>") or pathlib. Helper-tool paths such as ls/find results are relative to the workspace root. Files are not iterable — use .read()/.readlines(); parse JSON with json.loads(text). Writes through the mount raise PermissionError.${writeHelpers.length ? ' Use the listed ' + writeHelpers.map((name) => name + '()').join('/') + ' helpers for derived file changes; use regular edit/write tools for authored content.' : ''}`,
             ]
           : []),
       ].join('\n')
@@ -329,7 +330,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         `Use ${toolName} for multi-step tool workflows: loop/filter/aggregate in code and print only the result, instead of issuing many separate tool calls.`,
         ...(bridge
           ? [
-              `Route file changes by how the content is produced. DERIVED content — computed from data (manifests, indexes, conversions, extractions), the same mechanical transform across many files, or writes that must pass programmatic checks first — belongs inside ${toolName} via write()/edit(): code computes it exactly and verifies before writing${options.autoApprove ? '' : ', and each mutation is shown for approval'}. AUTHORED content — new code or prose you are composing, or a single judgment-driven edit — belongs in the regular edit/write tools.`,
+              `Route file changes by how the content is produced. DERIVED content — computed from data (manifests, indexes, conversions, extractions), the same mechanical transform across many files, or writes that must pass programmatic checks first — belongs inside ${toolName} via available write()/edit() helpers: code computes it exactly and verifies before writing${options.autoApprove ? '' : ', and each mutation is shown for approval'}. AUTHORED content — new code or prose you are composing, or a single judgment-driven edit — belongs in the regular edit/write tools.`,
             ]
           : []),
         ...(registry.list().length > 0
@@ -406,16 +407,19 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           }
           const cell = liveCells.get(requestedCell)
           let result: CodeResult
+          let observation: string | undefined
           if (cell) {
             if (params.cancel !== undefined) cell.cancel()
             const completed = await cell.wait(steering, signal)
             if (!completed) return running(cell)
             result = completed
+            observation = cell.observation
           } else {
             try {
               const record = readCodeCell(cellDirectory, requestedCell)
               if (record.status === 'running') return unknown(requestedCell, 'the prior process left an unfinished record')
               result = record.result
+              observation = record.observation
             } catch (error) {
               if (pendingCellId === requestedCell) {
                 return unknown(requestedCell, error instanceof Error ? error.message : String(error))
@@ -438,9 +442,17 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           }
           liveCells.delete(requestedCell)
           // An old handle is an observation. Never roll back a newer Python heap.
+          const status = result.details.status === 'suspended' ? 'paused'
+            : result.details.status === 'error' ? 'failed' : 'completed'
+          const savedOutput = observation ?? ('(The original output preview is unavailable.)' +
+            (result.details.output
+              ? '\nRead saved output with {"output":"' + result.details.output.id + '","offset":0}.'
+              : ''))
           return {
-            content: result.content,
-            details: { ...controlDetails(result.details.status), output: result.details.output,
+            content: [{ type: 'text', text: '[historical] Saved result for code cell ' + requestedCell +
+              '. Recorded status: ' + status + '. This observation cannot control the current Python script. ' +
+              'The current session state is unchanged.\n\n' + (savedOutput || '(No output was saved.)') }],
+            details: { ...controlDetails('ok'), historical: true, output: result.details.output,
               cell: { id: requestedCell, status: 'complete' } },
           }
         }
@@ -548,6 +560,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
             const text = capture.snapshot()
             if (text && !text.endsWith('\n')) capture.append('\n')
           }
+          let continuation = ''
           if (result.status === 'ok') {
             if (result.output !== null && result.output !== undefined) {
               separate()
@@ -555,26 +568,27 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
             }
             if (!capture.snapshot()) capture.append('(no output)')
           } else if (result.status === 'suspended') {
-            separate()
             if (result.suspensionReason === 'steering') {
-              capture.append('[paused] New user input paused the script before ' +
+              continuation = '[paused] New user input paused the script before ' +
                 formatCall(result.suspendedCall, 200) +
                 '. Completed work will not repeat. Address the new input, then use {"resume": true} ' +
-                'to continue or {"abandon":true} to discard the remaining steps.')
+                'to continue or {"abandon":true} to discard the remaining steps.'
             } else {
-              capture.append('[suspended] The script is paused awaiting user approval of ' +
+              continuation = '[suspended] The script is paused awaiting user approval of ' +
                 formatCall(result.suspendedCall, 200) +
                 '. Nothing after that call has run; completed work will not repeat. STOP and tell the user ' +
-                'what is pending. Wait for their decision, then use {"resume": true} or {"abandon":true}.')
+                'what is pending. Wait for their decision, then use {"resume": true} or {"abandon":true}.'
             }
           } else {
             separate()
             capture.append(result.error)
           }
           const output = capture.finish(toolName)
+          execution.observation = output.text
+          const text = output.text + (continuation && output.text && !output.text.endsWith('\n') ? '\n' : '') + continuation
           const nested = takeNestedToolCalls?.()
           return {
-            content: [{ type: 'text', text: output.text }],
+            content: [{ type: 'text', text }],
             ...(nested?.calls ? { nestedCalls: nested.calls } : {}),
             ...(nested?.usage ? { usage: nested.usage } : {}),
             details: {

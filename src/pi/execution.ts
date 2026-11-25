@@ -16,6 +16,7 @@ export interface PythonDetails {
   calls: string[]
   output?: OutputReference
   cell?: CodeCellReference
+  historical?: true
 }
 
 // The runtime owns these bounded records. Structural types support the older Pi SDK used to build this package.
@@ -49,7 +50,7 @@ export interface UserSteeringContext {
 
 type CellRecord =
   | { version: 1; id: string; status: 'running'; state: string }
-  | { version: 1; id: string; status: 'complete'; result: CodeResult }
+  | { version: 1; id: string; status: 'complete'; result: CodeResult; observation?: string }
 
 /** Owns one execution while its foreground waiter can yield to user input. */
 export class CodeCell {
@@ -59,6 +60,8 @@ export class CodeCell {
   foreground = true
   yieldRequested = false
   waitReason: 'steering' | 'aborted' = 'steering'
+  /** Saved output without session-specific continuation instructions. Never sent as result metadata. */
+  observation: string | undefined
   private result: CodeResult | undefined
   private detached = false
   private storageError: string | undefined
@@ -133,7 +136,7 @@ export class CodeCell {
 
   private persist(): void {
     const record: CellRecord = this.result
-      ? { version: 1, id: this.id, status: 'complete', result: this.result }
+      ? { version: 1, id: this.id, status: 'complete', result: this.result, observation: this.observation }
       : { version: 1, id: this.id, status: 'running', state: this.state }
     try {
       mkdirSync(this.directory, { recursive: true, mode: 0o700 })
@@ -165,8 +168,10 @@ export function readCodeCell(directory: string, id: string): CellRecord {
   if (record.status === 'running' && 'state' in record && typeof record.state === 'string') {
     return { version: 1, id, status: 'running', state: record.state }
   }
-  if (record.status === 'complete' && 'result' in record && validResult(record.result)) {
-    return { version: 1, id, status: 'complete', result: record.result }
+  if (record.status === 'complete' && 'result' in record && validResult(record.result) &&
+      (!('observation' in record) || record.observation === undefined || typeof record.observation === 'string')) {
+    return { version: 1, id, status: 'complete', result: record.result,
+      observation: 'observation' in record ? record.observation as string | undefined : undefined }
   }
   throw new Error('Malformed saved code cell')
 }
