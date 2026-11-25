@@ -39,6 +39,7 @@ function deferred<T>() {
 async function load(outputDirectory: string, tools: HostTool[] = [], bridgePiTools = false) {
   let tool!: TestTool
   let restore!: (event: unknown, context: unknown) => void
+  let beforeSettle!: (event: unknown, context: unknown) => Promise<void> | void
   let pending = false
   const listeners = new Set<() => void>()
   const context: UserSteeringContext = {
@@ -52,12 +53,17 @@ async function load(outputDirectory: string, tools: HostTool[] = [], bridgePiToo
     outputDirectory, tools, toolStore: false, noBuiltins: true, bridgePiTools, autoApprove: true,
   })({
     registerTool: (registered: TestTool) => { tool = registered },
-    on: (name: string, handler: typeof restore) => { if (name === 'session_start') restore = handler },
+    on: (name: string, handler: typeof beforeSettle) => {
+      if (name === 'session_start') restore = handler
+      if (name === 'agent_before_settle') beforeSettle = handler
+    },
   } as never)
   return {
     tool, context, listeners,
     steer: () => { pending = true; for (const listener of listeners) listener() },
     consume: () => { pending = false },
+    settle: (extra: Record<string, unknown> = {}) => beforeSettle({}, { ...context, ...extra }),
+    restoreEntries: (entries: unknown[]) => restore({}, { sessionManager: { getBranch: () => entries } }),
     restore: (result: CodeResult) => restore({}, {
       sessionManager: { getBranch: () => [{ type: 'message', message: { toolName: 'code', details: result.details } }] },
     }),
@@ -407,6 +413,199 @@ describe('foreground code yielding', () => {
     expect(rejected.details.cell?.id).toBe(yielded.details.cell!.id)
     const completed = await extension.run({ wait: yielded.details.cell!.id })
     expect(completed.content[0].text).toBe('=> "kept"')
+  })
+
+
+  it('publishes detached completion before settlement while keeping new input responsive', async () => {
+    const outputDirectory = await directory()
+    const started = deferred<void>()
+    const release = deferred<string>()
+    let firstCalls = 0
+    let laterCalls = 0
+    let takes = 0
+    const tools = [
+      host('first', () => { firstCalls++; started.resolve(); return release.promise }),
+      host('later', () => { laterCalls++; return 'later' }),
+    ]
+    const extension = await load(outputDirectory, tools)
+    const published: CodeResult[] = []
+    const evidence = {
+      calls: { calls: [{ id: 'original/1', name: 'write', arguments: { path: 'saved.txt' },
+        status: 'ok' as const }], complete: true },
+      usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    }
+    const executing = extension.run({ code: 'value = first()\nprint(value)\nlater()' }, {
+      takeNestedToolCalls: () => { takes++; return evidence },
+      publishToolCompletion: (result: CodeResult) => published.push(result),
+    })
+    await started.promise
+    extension.steer()
+    const yielded = await executing
+    extension.consume()
+    const interrupted = extension.settle()
+    expect(published).toHaveLength(0)
+    extension.steer()
+    await interrupted
+    expect(published).toHaveLength(0)
+    expect(extension.listeners.size).toBe(0)
+    extension.consume()
+    const settling = extension.settle()
+    release.resolve('written once')
+    await settling
+    expect(published).toHaveLength(1)
+    const completed = published[0]
+    expect(completed.details.status).toBe('suspended')
+    expect(completed.details.cell).toEqual({ id: yielded.details.cell!.id, status: 'complete' })
+    expect(completed.nestedCalls).toEqual(evidence.calls)
+    expect(completed.usage).toEqual(evidence.usage)
+    expect(completed.isError).toBe(false)
+    expect(takes).toBe(1)
+    expect(firstCalls).toBe(1)
+    expect(laterCalls).toBe(0)
+    expect(extension.listeners.size).toBe(0)
+    await extension.settle()
+    expect(published).toHaveLength(1)
+    const duplicate = await extension.run({ wait: yielded.details.cell!.id })
+    expect(duplicate.details.historical).toBe(true)
+    expect(duplicate.nestedCalls).toBeUndefined()
+    expect(duplicate.usage).toBeUndefined()
+
+    const restarted = await load(outputDirectory, tools)
+    restarted.restoreEntries([
+      { type: 'message', message: { toolName: 'code', details: yielded.details } },
+      { type: 'tool_completion', toolCallId: 'call', toolName: 'code', result: completed },
+    ])
+    const resumed = await restarted.run({ resume: true })
+    expect(resumed.details.status, resumed.content[0].text).toBe('ok')
+    expect(firstCalls).toBe(1)
+    expect(laterCalls).toBe(1)
+    expect((await restarted.run({ code: 'value' })).content[0].text).toBe('=> "written once"')
+  })
+
+  it.each(['wait', 'settle'])('delivers completed evidence once when %s starts collecting first', async (first) => {
+    const started = deferred<void>()
+    const release = deferred<string>()
+    const extension = await load(await directory(), [
+      host('effect', () => { started.resolve(); return release.promise }),
+    ])
+    const published: CodeResult[] = []
+    const evidence = {
+      calls: { calls: [{ id: 'original/1', name: 'write', status: 'ok' as const }], complete: true },
+      usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    }
+    const executing = extension.run({ code: 'value = effect()\nvalue' }, {
+      takeNestedToolCalls: () => evidence,
+      publishToolCompletion: (result: CodeResult) => published.push(result),
+    })
+    await started.promise
+    extension.steer()
+    const yielded = await executing
+    extension.consume()
+    let waiting: Promise<CodeResult>
+    let settling: Promise<void> | void
+    if (first === 'wait') {
+      waiting = extension.run({ wait: yielded.details.cell!.id })
+      settling = extension.settle()
+    } else {
+      settling = extension.settle()
+      waiting = extension.run({ wait: yielded.details.cell!.id })
+    }
+    release.resolve('done')
+    const [collected] = await Promise.all([waiting, settling])
+    const deliveries = [...published, collected].filter((result) => result.nestedCalls !== undefined)
+    expect(deliveries).toHaveLength(1)
+    expect(deliveries[0].nestedCalls).toEqual(evidence.calls)
+    expect(deliveries[0].usage).toEqual(evidence.usage)
+    expect((await extension.run({ code: 'value' })).content[0].text).toBe('=> "done"')
+    expect(extension.listeners.size).toBe(0)
+  })
+
+  it('keeps a completed pending cell recoverable when publication fails', async () => {
+    const started = deferred<void>()
+    const release = deferred<string>()
+    const extension = await load(await directory(), [
+      host('effect', () => { started.resolve(); return release.promise }),
+    ])
+    const executing = extension.run({ code: 'value = effect()\nvalue' }, {
+      publishToolCompletion: () => { throw new Error('session append failed') },
+    })
+    await started.promise
+    extension.steer()
+    const yielded = await executing
+    extension.consume()
+    release.resolve('kept')
+    await expect(extension.settle()).rejects.toThrow('session append failed')
+    const blocked = await extension.run({ code: '1' })
+    expect(blocked.details.cell!.id).toBe(yielded.details.cell!.id)
+    expect(blocked.content[0].text).toContain('Collect the pending')
+    const collected = await extension.run({ wait: yielded.details.cell!.id })
+    expect(collected.content[0].text).toBe('=> "kept"')
+    expect((await extension.run({ code: 'value' })).content[0].text).toBe('=> "kept"')
+  })
+
+  it('does not publish or adopt a completion into a newly selected branch', async () => {
+    const started = deferred<void>()
+    const release = deferred<string>()
+    const extension = await load(await directory(), [
+      host('effect', () => { started.resolve(); return release.promise }),
+    ])
+    const published: CodeResult[] = []
+    const base = await extension.run({ code: 'value: str = "base"' })
+    const executing = extension.run({ code: 'value = effect()\nvalue' }, {
+      publishToolCompletion: (result: CodeResult) => published.push(result),
+    })
+    await started.promise
+    extension.steer()
+    const yielded = await executing
+    extension.consume()
+    const settling = extension.settle()
+    extension.restore(base)
+    const newer = await extension.run({ code: 'value = "new branch"' })
+    release.resolve('old branch')
+    await settling
+    expect(published).toHaveLength(0)
+    const historical = await extension.run({ wait: yielded.details.cell!.id })
+    expect(historical.details.historical).toBe(true)
+    expect(historical.details.state).toBe(newer.details.state)
+    expect((await extension.run({ code: 'value' })).content[0].text).toBe('=> "new branch"')
+  })
+
+  it('cancels a held host call when the settlement boundary is explicitly stopped', async () => {
+    const extension = await load(await directory(), [], true)
+    const started = deferred<void>()
+    const published: CodeResult[] = []
+    let aborted = false
+    const context = {
+      publishToolCompletion: (result: CodeResult) => published.push(result),
+      tools: [{ name: 'read', description: 'read',
+        parameters: { properties: { path: { type: 'string' } }, required: ['path'] } }],
+      executeTool: (_name: string, _args: unknown, options: { signal: AbortSignal }) => {
+        started.resolve()
+        return new Promise<never>((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            aborted = true
+            reject(new Error('boundary cancelled'))
+          }, { once: true })
+        })
+      },
+    }
+    const executing = extension.run({ code: 'read("held")' }, context)
+    await started.promise
+    extension.steer()
+    const yielded = await executing
+    extension.consume()
+    const controller = new AbortController()
+    const settling = extension.settle({ signal: controller.signal })
+    controller.abort()
+    await settling
+    expect(aborted).toBe(true)
+    expect(published).toHaveLength(0)
+    expect(extension.listeners.size).toBe(0)
+    const result = await extension.run({ wait: yielded.details.cell!.id })
+    expect(result.details.status).toBe('error')
+    expect(result.content[0].text).toContain('aborted')
   })
 
   it('retains complete large stdout and its traceback while bounding every streamed update', async () => {

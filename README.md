@@ -78,6 +78,12 @@ running. Before the next host call, the interpreter saves a paused frame.
   result. Completed host effects remain. Stopping a later foreground wait returns
   the cell handle without cancelling the background call.
 - New code cannot compete with an uncollected cell in the same Python session.
+- Before a managed agent settles, it waits for the active host call to finish and
+  publishes the saved result, edited-file evidence, and usage once. New user input
+  interrupts this wait. The remaining Python steps stay paused until resumed.
+  An explicit Stop during this settlement wait cancels the live cell.
+- Reading an already collected cell shows saved output without continuation
+  instructions and leaves the current Python state unchanged.
 - Completed cells can be collected after restarting Pi. An unfinished record after
   restart has an unknown outcome. Check the host effects before abandoning or
   resetting it. The extension never replays that execution.

@@ -38,11 +38,15 @@ type ToolUsage = Extract<AgentEndEvent['messages'][number], { role: 'assistant' 
 export interface CodeResult {
   content: { type: 'text'; text: string }[]
   details: PythonDetails
+  isError?: boolean
   nestedCalls?: NestedCalls
   usage?: ToolUsage
 }
 
 export interface UserSteeringContext {
+  /** Boundary cancellation. User steering is a separate event and does not abort this signal. */
+  signal?: AbortSignal
+  publishToolCompletion?(result: CodeResult): void
   hasPendingUserSteering?(): boolean
   onUserSteering?(listener: () => void): () => void
   takeNestedToolCalls?(): { calls?: NestedCalls; usage?: ToolUsage } | undefined
@@ -73,6 +77,7 @@ export class CodeCell {
     state: string,
     signal: AbortSignal | undefined,
     run: (cell: CodeCell) => Promise<CodeResult>,
+    readonly publishCompletion?: (result: CodeResult) => void,
   ) {
     this.directory = directory
     this.state = state
@@ -186,6 +191,7 @@ function validResult(value: unknown): value is CodeResult {
     'status' in details && ['ok', 'error', 'suspended'].includes(String(details.status)) &&
     'calls' in details && Array.isArray(details.calls) &&
     details.calls.every((name: unknown) => typeof name === 'string') &&
+    (!('isError' in value) || value.isError === undefined || typeof value.isError === 'boolean') &&
     (!('nestedCalls' in value) || value.nestedCalls === undefined || validNestedCalls(value.nestedCalls)) &&
     (!('usage' in value) || value.usage === undefined || validUsage(value.usage))
 }

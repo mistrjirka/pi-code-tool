@@ -126,6 +126,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     const cellDirectory = join(outputDirectory, 'cells')
     const liveCells = new Map<string, CodeCell>()
     let pendingCellId: string | undefined
+    let sessionEpoch = 0
     const importableModules = await probeImportableModules()
     // Bind only the current workspace for each operation, including restored frames.
     let makeMount: (() => MountDir) | undefined
@@ -225,16 +226,22 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
     // branch — `details` travels with the session file, so this survives
     // restores and branching.
     pi.on('session_start', (_event, ctx) => {
+      sessionEpoch++
       let state: string | undefined
       pendingCellId = undefined
       // Walking backwards avoids reading every historical state snapshot.
       // SessionManager can lazily load large tool-result details from disk.
       const branch = ctx.sessionManager.getBranch()
       for (let index = branch.length - 1; index >= 0; index--) {
-        const entry = branch[index]
-        if (entry?.type !== 'message') continue
-        const message = entry.message as { toolName?: string; details?: PythonDetails }
-        if (message.toolName === toolName && message.details?.state) {
+        // Managed runtimes persist detached completion as its own typed entry.
+        const entry = branch[index] as {
+          type: string; toolName?: string; result?: CodeResult
+          message?: { toolName?: string; details?: PythonDetails }
+        } | undefined
+        const message = entry?.type === 'message' ? entry.message
+          : entry?.type === 'tool_completion' ? { toolName: entry.toolName, details: entry.result?.details }
+          : undefined
+        if (message?.toolName === toolName && message.details?.state) {
           state = message.details.state
           if (message.details.cell?.status === 'running' || message.details.cell?.status === 'unknown') {
             pendingCellId = message.details.cell.id
@@ -257,6 +264,50 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           }
         }
       }
+    })
+
+    function prepareCellState(result: CodeResult) {
+      const encoded = result.details.state
+      const decoded = decodeSessionState(encoded)
+      return { session: Session.load(decoded, sessionOptions), restored: { encoded, decoded } }
+    }
+
+    // The older build SDK lacks this managed-runtime lifecycle event.
+    const lifecycle = pi as unknown as {
+      on(event: 'agent_before_settle',
+        handler: (event: unknown, context: UserSteeringContext) => Promise<void>): void
+    }
+    lifecycle.on('agent_before_settle', async (_event, context) => {
+      const epoch = sessionEpoch
+      const cell = pendingCellId ? liveCells.get(pendingCellId) : undefined
+      const publish = cell?.publishCompletion
+      if (!cell || !publish) return
+      const cancel = () => cell.cancel()
+      context.signal?.addEventListener('abort', cancel, { once: true })
+      if (context.signal?.aborted) cancel()
+      let result: CodeResult | undefined
+      try {
+        // Accepted steering releases this wait so a new user request can run.
+        result = await cell.wait(context, context.signal)
+      } finally {
+        context.signal?.removeEventListener('abort', cancel)
+      }
+      if (!result || context.signal?.aborted || epoch !== sessionEpoch || pendingCellId !== cell.id) return
+      const loaded = prepareCellState(result)
+      const completed: CodeResult = {
+        ...result,
+        isError: result.details.status === 'error',
+        details: { ...result.details, cell: { id: cell.id, status: 'complete' } },
+      }
+      // Publishing is synchronous, durable and idempotent. A failure leaves the
+      // pending handle owned here so an explicit wait can still collect it.
+      publish(completed)
+      if (epoch !== sessionEpoch || pendingCellId !== cell.id) return
+      session = loaded.session
+      restoredState = loaded.restored
+      blockedState = null
+      pendingCellId = undefined
+      liveCells.delete(cell.id)
     })
 
     function describe(visibleRegistry: ToolRegistry = registry, sessionBacked = false): string {
@@ -349,6 +400,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
         // Optional managed-runtime hooks are absent from older Pi SDK declarations.
         const steering = (ctx ?? {}) as UserSteeringContext
         const takeNestedToolCalls = steering.takeNestedToolCalls?.bind(steering)
+        const publishCompletion = steering.publishToolCompletion?.bind(steering)
         const controlDetails = (status: PythonDetails['status']): PythonDetails => ({
           status,
           state: blockedState?.state ?? (session ? savedState(session) : ''),
@@ -429,9 +481,9 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
           }
           if (pendingCellId === requestedCell) {
             try {
-              const decoded = decodeSessionState(result.details.state)
-              session = Session.load(decoded, sessionOptions)
-              restoredState = { encoded: result.details.state, decoded }
+              const loaded = prepareCellState(result)
+              session = loaded.session
+              restoredState = loaded.restored
               blockedState = null
             } catch (error) {
               return unknown(requestedCell, error instanceof Error ? error.message : String(error))
@@ -597,7 +649,7 @@ export function createPythonExtension(options: PythonExtensionOptions = {}) {
               ...(output.output ? { output: output.output } : {}),
             },
           }
-        })
+        }, publishCompletion)
         liveCells.set(cell.id, cell)
         pendingCellId = cell.id
         const result = await cell.wait(steering, signal)
