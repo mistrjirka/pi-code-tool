@@ -99,6 +99,8 @@ export interface RunOptions {
   maxStdoutBytes?: number
   /** Streaming observer for print() chunks, called as they happen (uncapped). */
   onPrint?: (text: string) => void
+  /** Pause at the next host-call boundary, retaining a resumable native checkpoint. */
+  shouldYield?: () => boolean
   /**
    * Lines the caller prepended to the code, subtracted from typing-diagnostic
    * line numbers so they point into the original submitted source.
@@ -156,8 +158,10 @@ export interface RunSuspended extends RunResultBase {
   output: undefined
   /** Model-facing suspension description. */
   error: string
-  /** The gated call awaiting a decision. */
+  /** The next host call, which has not executed. */
   suspendedCall: ApprovalRequest
+  /** Missing on older results, where every suspension required approval. */
+  suspensionReason?: 'approval' | 'steering'
 }
 
 export type RunResult = RunSuccess | RunError | RunSuspended

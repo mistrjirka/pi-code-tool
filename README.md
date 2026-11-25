@@ -39,21 +39,52 @@ per call. The workspace is also **mounted read-only at `/workspace`** for plain
 sessions). Variables persist across calls; state rides in tool-result `details`, so
 it survives session restore and branching.
 
-**Mutating tools (`bash`, `edit`, `write`) are approval-gated**: the script freezes
-mid-execution at the call, pi shows a confirm dialog with the exact invocation, and
-your answer resumes the script in place — deny and the sandbox raises a catchable
-`PermissionError`, or pick **"Decide later"** to suspend the run entirely: completed
-work stays cached, the suspension survives pi restarts, and `{"resume": true}`
-continues the script from the exact gated call — even days later; `{"abandon": true}`
-discards the pending gated call without resetting the rest of the session. The model writes a
-30-line codemod; you approve each mutation without it burning a single extra token.
-Replayed (already-approved) calls never re-prompt. Headless runs deny gated calls
-unless you opt in with `autoApprove`.
+The managed PiTTy export runs `bash`, `edit`, and `write` through the session's tool
+settings without an extra approval dialog. Factory callers use per-call approval
+unless they set `autoApprove: true`. A denied call raises a catchable
+`PermissionError`. "Decide later" saves the paused interpreter frame:
+`{"resume": true}` continues at that call, including after a restart, and
+`{"abandon": true}` discards the remaining steps. Completed calls never repeat.
 
 Code is **statically type-checked before execution** (monty's bundled `ty`) against
 typed stubs of every host tool — wrong argument types, bad methods on tool results,
 and undefined names come back as compiler diagnostics *before any side effects run*,
 instead of as tracebacks after three tool calls already happened.
+
+## Output and user steering
+
+Small results remain unchanged. Larger results show a bounded beginning and end,
+including final diagnostics, plus an output id. Printed output beyond the preview
+is saved in private files under the agent directory. Read only the needed page:
+
+```json
+{"output": "returned-output-id", "offset": 0, "limit": 4096}
+```
+
+Offsets are bytes. Each page returns the next valid UTF-8 offset. Pages are limited
+to 7 KiB. Stored output is limited to 64 MiB per execution; the result states when
+that limit or a storage error prevents saving everything. Tool-result details
+contain the id and byte counts, not the full output. Branches in the same workspace
+can read earlier output ids.
+
+With the managed runtime's user-steering hooks, a new message releases the
+foreground immediately and returns a running cell id. The current host call keeps
+running. Before the next host call, the interpreter saves a paused frame.
+
+- `{"wait": "returned-cell-id"}` collects the existing execution without rerunning it.
+- If it paused for input, address the new request, then use `{"resume": true}` to
+  continue or `{"abandon": true}` to discard the remaining steps.
+- `{"cancel": "returned-cell-id"}` explicitly aborts a live cell and collects its
+  result. Completed host effects remain. Stopping a later foreground wait returns
+  the cell handle without cancelling the background call.
+- New code cannot compete with an uncollected cell in the same Python session.
+- Completed cells can be collected after restarting Pi. An unfinished record after
+  restart has an unknown outcome. Check the host effects before abandoning or
+  resetting it. The extension never replays that execution.
+
+Pure Python runs can yield only when the interpreter reaches a host-call boundary
+or returns. The existing execution-time limit still applies. Older Pi runtimes
+without the steering hooks retain the normal wait-until-finished behavior.
 
 ## Example pi session
 
@@ -210,7 +241,9 @@ src/core/    runner.ts    CodeRunner: owns native feed/resume dispatch; tool dis
              runtime.ts   Worker lifetime, version pin, and bounded checkpoints
              toolstore.ts Agent-saved tools as plain .py files + manage-from-sandbox
 src/pi/      extension.ts pi adapter: `code` tool (configurable name), streaming output, branch-safe state
-             bridge.ts    pi built-in tools → Python stubs; bash/edit/write approval-gated
+             bridge.ts    pi built-in tools → Python stubs and session dispatch
+             output.ts    Bounded previews and recoverable output pages
+             execution.ts Foreground yielding and durable cell completion records
 ```
 
 Historical Monty 0.0.18 findings are retained in

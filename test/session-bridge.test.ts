@@ -92,10 +92,12 @@ describe('session-backed Python bridge', () => {
       code: 'print(read(file="notes.txt"))\nprint(bash("safe command", background=True))',
     }, controller.signal, undefined, context)
     expect(first.details.status).toBe('ok')
-    expect(calls).toEqual([
-      { name: 'read', args: { file: 'notes.txt' }, signal: controller.signal },
-      { name: 'bash', args: { command: 'safe command', background: true }, signal: controller.signal },
+    expect(calls.map(({ signal: _signal, ...call }) => call)).toEqual([
+      { name: 'read', args: { file: 'notes.txt' } },
+      { name: 'bash', args: { command: 'safe command', background: true } },
     ])
+    expect(calls[0].signal?.aborted).toBe(false)
+    expect(calls[1].signal).toBe(calls[0].signal)
     context.tools = [readTool('resource')]
     const second = await code.execute('two', { reset: true, code: 'read(resource="changed")' },
       undefined, undefined, context)
@@ -247,9 +249,16 @@ describe('session-backed Python bridge', () => {
     expect((await secondRun).content[0].text).toContain('second session')
     releaseFirst.resolve()
     expect((await firstRun).content[0].text).toContain('first session')
-    expect(calls).toEqual([
-      { session: 'first', name: 'read', args: { file: 'a' }, signal: firstController.signal },
-      { session: 'second', name: 'read', args: { resource: 'b' }, signal: secondController.signal },
+    expect(calls.map(({ signal: _signal, ...call }) => call)).toEqual([
+      { session: 'first', name: 'read', args: { file: 'a' } },
+      { session: 'second', name: 'read', args: { resource: 'b' } },
     ])
+    expect(calls[0].signal?.aborted).toBe(false)
+    expect(calls[1].signal?.aborted).toBe(false)
+    expect(calls[0].signal).not.toBe(calls[1].signal)
+    // A completed cell must release its original caller's abort listener.
+    firstController.abort()
+    expect(calls[0].signal?.aborted).toBe(false)
+    expect(calls[1].signal?.aborted).toBe(false)
   })
 })
